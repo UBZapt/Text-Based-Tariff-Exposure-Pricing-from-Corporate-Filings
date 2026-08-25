@@ -1,3 +1,73 @@
+# ==========================================================================
+# PROJECT-SPECIFIC - sensitive, licensed, or private. DO NOT COMMIT.
+# ==========================================================================
+
+# --- Licensed research data (WRDS: CRSP, Compustat, CCM) + all other data ---
+# All raw data and anything derived from it must not be published.
+*.csv
+*.dta
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.sas7bdat
+*.sas7bcat
+*.h5
+*.hdf5
+*.zip
+*.gz
+*.tar
+*.7z
+# Pipeline outputs derived from licensed data (redundant with *.csv, kept explicit)
+clean_firm_bridge.csv
+edgar_pull_log.csv
+
+# --- Cached SEC filings (bulk raw HTML) ---
+filings_raw/
+
+# --- Internal methodology & project instructions (not for publication) ---
+CLAUDE.md
+Tariff_Factor_Research_Design_v*.md
+build_notes.md
+
+# --- Credentials & secrets: use environment variables / a local .env instead ---
+.env
+.env.*
+!.env.example
+secrets.*
+.secrets/
+credentials.*
+*.credentials
+.netrc
+# WRDS / Postgres auth
+.pgpass
+*.pgpass
+pgpass.conf
+wrds_credentials.*
+# Private keys & certificates
+*.key
+*.pem
+*.p12
+*.pfx
+*.pkcs12
+id_rsa
+*.ppk
+
+# --- Claude Code local settings ---
+.claude/settings.local.json
+
+# --- CLAUDE.md-mandated minimums ---
+output/
+logs/*.tmp
+
+# --- OS / editor cruft & office lock files ---
+~$*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================================================
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
