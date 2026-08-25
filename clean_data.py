@@ -22,8 +22,16 @@ import pandas as pd
 BASE = Path(__file__).resolve().parent
 CRSP_FILE = BASE / "Monthly Returns.csv"
 LINK_FILE = BASE / "PERMNO - GVKEY - CIK.csv"
-GEO_FILE = BASE / "Compustat Geographic segment data.csv"
+GEO_FILE = BASE / "Compustat Geographic segment data.csv"  # not touched in this task
+FF_FILE = BASE / "FF5_MOM_Factors.csv"
+EPU_FILE = BASE / "US_Policy_Uncertainty_Data.xlsx"
 BRIDGE_OUT = BASE / "clean_firm_bridge.csv"
+RETURNS_OUT = BASE / "clean_returns.csv"
+FF_OUT = BASE / "clean_ff5_mom.csv"
+EPU_OUT = BASE / "clean_epu.csv"
+
+EPU_SHEET = "Main News Index"                 # sheet holding the chosen EPU series
+EPU_VALUE_COL = "News_Based_Policy_Uncert_Index"  # chosen EPU variant (user decision)
 
 REFERENCE_DATE = pd.Timestamp("2025-04-02")  # "Liberation Day" tariffs
 PRICE_MIN = 1.0                              # keep price > $1
@@ -48,14 +56,24 @@ def _note(msg: str) -> None:
     print(msg)
 
 
+def to_month_end(dates) -> pd.Series:
+    """Normalise a datetime series to the calendar month-end Timestamp.
+
+    Gives one uniform monthly join key across the CRSP, factor, and EPU panels:
+    CRSP MthCalDt and FF dateff carry last-trading-day dates while EPU has only
+    Year+Month, so all are collapsed to the last calendar day of the month.
+    """
+    return pd.to_datetime(dates).dt.to_period("M").dt.to_timestamp("M")
+
+
 # --------------------------------------------------------------------------- #
 # Part A.1 — Inspect raw date fields BEFORE any parsing                        #
 # --------------------------------------------------------------------------- #
 def inspect_dates() -> None:
     """Print the raw dtype and a sample of every date-like field, unparsed.
 
-    Confirms format assumptions (yyyymm, datadate, linkdt, linkenddt) against the
-    actual files instead of assuming consistency across sources.
+    Confirms format assumptions (yyyymm, datadate, linkdt, linkenddt, dateff,
+    Year/Month) against the actual files instead of assuming consistency.
     """
     print("=" * 70)
     print("DATE-FIELD INSPECTION (raw, pre-parse)")
@@ -64,12 +82,15 @@ def inspect_dates() -> None:
         (CRSP_FILE, ["YYYYMM", "MthCalDt"]),
         (LINK_FILE, ["LINKDT", "LINKENDDT"]),
         (GEO_FILE, ["datadate"]),
+        (FF_FILE, ["dateff"]),
     ]
     for path, fields in checks:
         head = pd.read_csv(path, usecols=fields, dtype=str, nrows=5)
         for f in fields:
-            vals = head[f].tolist()
-            print(f"  {path.name:45s} {f:12s} dtype=str  sample={vals}")
+            print(f"  {path.name:45s} {f:12s} dtype=str  sample={head[f].tolist()}")
+    epu = pd.read_excel(EPU_FILE, sheet_name=EPU_SHEET, nrows=3)[["Year", "Month"]]
+    print(f"  {EPU_FILE.name:45s} {'Year/Month':12s} "
+          f"sample={list(zip(epu['Year'], epu['Month']))}")
     print()
 
 
@@ -252,6 +273,113 @@ def log_disagreements(bridge: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Clean panel exports (returns, FF5+MOM, EPU)                                  #
+# --------------------------------------------------------------------------- #
+def export_returns(ce: pd.DataFrame) -> pd.DataFrame:
+    """Export the cleaned CRSP monthly returns panel to clean_returns.csv.
+
+    Standardises the date to calendar month-end and drops columns not needed for
+    the pricing tests, logging each drop and its reason.
+    """
+    dropped = {
+        "USIncFlg": "constant after common-equity filter (all 'Y')",
+        "IssuerType": "filter field (CORP/ACOR); no pricing use downstream",
+        "SecurityType": "constant after filter (all 'EQTY')",
+        "SecuritySubType": "constant after filter (all 'COM')",
+        "ShareType": "constant after filter (all 'NS')",
+        "YYYYMM": "superseded by canonical month-end 'date'",
+        "MthCalDt": "superseded by canonical month-end 'date'",
+        "MthPrc": "replaced by absolute-valued 'prc'",
+        "nyse_p10": "intermediate breakpoint threshold; not needed downstream",
+        "ShrOut": "redundant (me = prc x shrout)",
+        "Ticker": "not needed; permno is the join key",
+    }
+    panel = pd.DataFrame({
+        "permno": ce["PERMNO"],
+        "date": to_month_end(ce["MthCalDt"]),
+        "ret": ce["MthRet"],
+        "me": ce["MthCap"],
+        "prc": ce["price"],
+        "siccd": ce["SICCD"],
+        "primaryexch": ce["PrimaryExch"],
+        "below_nyse_p10": ce["below_nyse_p10"],
+    }).sort_values(["permno", "date"]).reset_index(drop=True)
+
+    for col, reason in dropped.items():
+        _note(f"[drop] returns.{col}: {reason}")
+    panel.to_csv(RETURNS_OUT, index=False)
+    _note(f"[info] Wrote {RETURNS_OUT.name} ({len(panel):,} rows; "
+          f"kept={list(panel.columns)}).")
+    return panel
+
+
+def clean_ff5_mom() -> pd.DataFrame:
+    """Clean the FF5+Momentum factor file to clean_ff5_mom.csv.
+
+    Standardises the date, verifies the percent-vs-decimal convention (converting
+    only if needed), and maps any missing-value sentinels to NaN. rf is retained
+    because the research design needs it for Sharpe and excess-return computation.
+    """
+    factors = ["mktrf", "smb", "hml", "rmw", "cma", "rf", "umd"]
+    ff = pd.read_csv(FF_FILE)
+    ff[factors] = ff[factors].apply(pd.to_numeric, errors="coerce")
+
+    max_abs = float(ff[factors].abs().max().max())
+    scale = "decimal" if max_abs < 1 else "percent"
+    _note(f"[info] FF units: max|value|={max_abs:.4f} -> {scale}; "
+          f"{'no conversion applied' if scale == 'decimal' else 'divided by 100'}.")
+    if scale == "percent":
+        ff[factors] = ff[factors] / 100.0
+
+    sentinels = [-99.99, -999, -0.9999, -9.99]
+    n_hits = int(ff[factors].isin(sentinels).sum().sum())
+    if n_hits:
+        ff[factors] = ff[factors].mask(ff[factors].isin(sentinels))
+    _note(f"[info] FF sentinel scan {sentinels}: {n_hits} value(s) -> NaN.")
+
+    ff["date"] = to_month_end(pd.to_datetime(ff["dateff"], format="%d/%m/%Y"))
+    out = ff[["date"] + factors].sort_values("date").reset_index(drop=True)
+    out.to_csv(FF_OUT, index=False)
+    _note(f"[info] Wrote {FF_OUT.name} ({len(out):,} rows; cols={list(out.columns)}; "
+          f"rf retained for Sharpe/excess returns).")
+    return out
+
+
+def clean_epu() -> pd.DataFrame:
+    """Clean the EPU index to clean_epu.csv.
+
+    Reports every EPU variant present (none silently dropped), keeps the chosen
+    News-Based series, and standardises the monthly date to calendar month-end.
+    """
+    xl = pd.ExcelFile(EPU_FILE)
+    variants = {s: [c for c in xl.parse(s, nrows=0).columns
+                    if c not in ("Year", "Month")] for s in xl.sheet_names}
+    _note(f"[info] EPU variants present (not silently picked): {variants}. "
+          f"Chosen = '{EPU_VALUE_COL}' from '{EPU_SHEET}' (user decision); "
+          f"no trade-policy sub-index exists in this file.")
+
+    df = xl.parse(EPU_SHEET)
+    for c in ["Year", "Month", EPU_VALUE_COL]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    n_raw = len(df)
+    df = df.dropna(subset=["Year", "Month", EPU_VALUE_COL])
+    if n_raw - len(df):
+        _note(f"[dq] EPU: dropped {n_raw - len(df)} non-data row(s) "
+              f"(trailing source-attribution text).")
+
+    ym = pd.to_datetime(dict(year=df["Year"].astype(int),
+                             month=df["Month"].astype(int), day=1))
+    out = (pd.DataFrame({"date": to_month_end(ym).values,
+                         "epu_news": df[EPU_VALUE_COL].values})
+           .sort_values("date").reset_index(drop=True))
+    _note(f"[info] EPU frequency = monthly; {len(out):,} rows, "
+          f"{out['date'].min().date()} -> {out['date'].max().date()}.")
+    out.to_csv(EPU_OUT, index=False)
+    _note(f"[info] Wrote {EPU_OUT.name} ({len(out):,} rows; cols={list(out.columns)}).")
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Assumptions summary                                                         #
 # --------------------------------------------------------------------------- #
 def print_assumptions() -> None:
@@ -273,6 +401,12 @@ def print_assumptions() -> None:
         "Bridge is long: one row per valid PERMNO-GVKEY-CIK link interval; "
         "date validity requires link interval to overlap the firm's CRSP observation range.",
         "Multi-GVKEY PERMNOs are logged, not resolved, at the cleaning stage.",
+        "All monthly panels (returns/FF/EPU) share a calendar month-end Timestamp 'date' as the "
+        "uniform join key; CRSP MthCalDt and FF dateff (last trading day) are normalised to it.",
+        "FF5+MOM values are decimals (not percent) - no /100 conversion; no missing sentinels present.",
+        "clean_ff5_mom retains rf (risk-free) for Sharpe / excess-return computation.",
+        "EPU = News-Based index (Main News Index sheet) per user decision; "
+        "other variants reported, not silently dropped.",
     ]:
         print(f"  - {line}")
     print()
@@ -287,11 +421,14 @@ def main() -> pd.DataFrame:
     ce = filter_common_equity(crsp)
     ce = apply_price_filter(ce)
     ce = flag_microcaps(ce)
+    export_returns(ce)
     link = load_link()
     bridge = build_bridge(ce, link)
     log_disagreements(bridge)
     bridge.to_csv(BRIDGE_OUT, index=False)
     _note(f"[info] Wrote {BRIDGE_OUT.name} ({len(bridge):,} rows).")
+    clean_ff5_mom()
+    clean_epu()
     print_assumptions()
     return bridge
 
