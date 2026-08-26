@@ -13,7 +13,10 @@ executes the full pipeline and writes clean_firm_bridge.csv.
 No text parsing, tokenization, or scoring is performed here (that is Step 2).
 """
 
+import io
+import re
 from pathlib import Path
+
 import pandas as pd
 
 # --------------------------------------------------------------------------- #
@@ -25,6 +28,7 @@ LINK_FILE = BASE / "PERMNO - GVKEY - CIK.csv"
 GEO_FILE = BASE / "Compustat Geographic segment data.csv"  # not touched in this task
 FF_FILE = BASE / "FF5_MOM_Factors.csv"
 EPU_FILE = BASE / "US_Policy_Uncertainty_Data.xlsx"
+ME_BP_FILE = BASE / "ME_Breakpoints.csv"      # Ken French NYSE ME breakpoints
 BRIDGE_OUT = BASE / "clean_firm_bridge.csv"
 RETURNS_OUT = BASE / "clean_returns.csv"
 FF_OUT = BASE / "clean_ff5_mom.csv"
@@ -36,7 +40,9 @@ EPU_VALUE_COL = "News_Based_Policy_Uncert_Index"  # chosen EPU variant (user dec
 REFERENCE_DATE = pd.Timestamp("2025-04-02")  # "Liberation Day" tariffs
 PRICE_MIN = 1.0                              # keep price > $1
 NYSE_PCTILE = 10                             # NYSE micro-cap breakpoint (10th pct)
-DROP_MICROCAPS = False                       # flag only by default; toggle to drop
+DROP_MICROCAPS = True                        # drop firm-months below the NYSE p10 breakpoint
+ME_BP_P10_FIELD = 3                          # French layout: [0]=YYYYMM [1]=count [2]=p5 [3]=p10
+ME_BP_SCALE = 1000.0                         # French ME is $millions; CRSP MthCap is $thousands
 OPEN_END = pd.Timestamp("2099-12-31")        # sentinel for still-active links ('E')
 
 COMMON_EQUITY_FILTER = {                      # CIZ-to-SIZ SHRCD 10/11 replication
@@ -66,6 +72,22 @@ def to_month_end(dates) -> pd.Series:
     return pd.to_datetime(dates).dt.to_period("M").dt.to_timestamp("M")
 
 
+def _me_bp_data_rows() -> list[str]:
+    """Return only the data rows of the French breakpoints file.
+
+    The file has a one-line text header, blank lines and a copyright footer, and
+    no column header row, so data rows are selected by pattern (leading YYYYMM)
+    rather than by offset. A plain read_csv fails on this file: pandas infers the
+    field count from the one-field text header and then rejects the 22-field rows.
+    """
+    rows = [ln for ln in ME_BP_FILE.read_text(encoding="utf-8").splitlines()
+            if re.match(r"^\s*\d{6}\s*,", ln)]
+    if not rows:
+        raise ValueError(f"{ME_BP_FILE.name}: no rows matched the leading-YYYYMM data "
+                         f"pattern; the file layout has changed.")
+    return rows
+
+
 # --------------------------------------------------------------------------- #
 # Part A.1 — Inspect raw date fields BEFORE any parsing                        #
 # --------------------------------------------------------------------------- #
@@ -91,6 +113,9 @@ def inspect_dates() -> None:
     epu = pd.read_excel(EPU_FILE, sheet_name=EPU_SHEET, nrows=3)[["Year", "Month"]]
     print(f"  {EPU_FILE.name:45s} {'Year/Month':12s} "
           f"sample={list(zip(epu['Year'], epu['Month']))}")
+    bp_rows = _me_bp_data_rows()[:3]
+    print(f"  {ME_BP_FILE.name:45s} {'YYYYMM':12s} dtype=str  "
+          f"sample={[r.split(',')[0].strip() for r in bp_rows]}  (no column header row)")
     print()
 
 
@@ -169,25 +194,67 @@ def apply_price_filter(df: pd.DataFrame) -> pd.DataFrame:
     return kept
 
 
-def flag_microcaps(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag firm-months below the per-month NYSE 10th-percentile market cap.
+def load_nyse_breakpoints() -> pd.DataFrame:
+    """Load the official Ken French NYSE ME breakpoints (date + nyse_p10).
 
-    Breakpoints are computed internally from NYSE-listed (PrimaryExch=='N')
-    common-equity firms each month — standard Fama-French practice. Adds the
-    boolean column ``below_nyse_p10``; rows are dropped only if DROP_MICROCAPS.
+    Fields are [YYYYMM, NYSE firm count, p5, p10, ..., p100] with no header row;
+    the 10th percentile is field ME_BP_P10_FIELD. French quotes ME in $millions
+    while CRSP MthCap is in $thousands, so the level is scaled by ME_BP_SCALE.
+    Returned dates use the shared calendar month-end join key.
+    """
+    raw = pd.read_csv(io.StringIO("\n".join(_me_bp_data_rows())),
+                      header=None, skipinitialspace=True)
+    bp = pd.DataFrame({
+        "date": to_month_end(pd.to_datetime(raw[0].astype(int).astype(str), format="%Y%m")),
+        "nyse_p10": pd.to_numeric(raw[ME_BP_P10_FIELD], errors="coerce") * ME_BP_SCALE,
+    })
+    if bp["date"].duplicated().any() or bp["nyse_p10"].isna().any():
+        raise ValueError(f"{ME_BP_FILE.name}: duplicate months or unparsable values in "
+                         f"field {ME_BP_P10_FIELD}; check the file layout.")
+    _note(f"[info] NYSE breakpoints: {len(bp):,} months "
+          f"{bp['date'].min():%Y-%m} -> {bp['date'].max():%Y-%m} from {ME_BP_FILE.name} "
+          f"(field {ME_BP_P10_FIELD} = p{NYSE_PCTILE}; $M x{ME_BP_SCALE:,.0f} -> $thousands).")
+    return bp
+
+
+def flag_microcaps(df: pd.DataFrame, bp: pd.DataFrame) -> pd.DataFrame:
+    """Drop firm-months below the official NYSE 10th-percentile market cap.
+
+    The breakpoint is the Ken French NYSE ME series (``bp``), merged on the
+    canonical month-end date. The previously internally-computed per-month
+    breakpoint is retained as a diagnostic only: both classifications are
+    reported so the change of source can be sanity-checked, but French governs
+    the ``below_nyse_p10`` flag and the drop (unless DROP_MICROCAPS is False).
     """
     df = df.copy()
+    df["date"] = to_month_end(df["MthCalDt"])
+
     q = NYSE_PCTILE / 100.0
-    bp = (df[df["PrimaryExch"] == "N"]
-          .groupby("YYYYMM")["MthCap"].quantile(q).rename("nyse_p10"))
-    df = df.merge(bp, on="YYYYMM", how="left")
+    internal = (df[df["PrimaryExch"] == "N"]
+                .groupby("date")["MthCap"].quantile(q).rename("nyse_p10_internal"))
+    df = df.merge(internal, on="date", how="left").merge(bp, on="date", how="left")
+
+    if df["nyse_p10"].isna().any():
+        gaps = sorted(df.loc[df["nyse_p10"].isna(), "date"].dt.strftime("%Y-%m").unique())
+        raise ValueError(f"{ME_BP_FILE.name} has no p{NYSE_PCTILE} breakpoint for "
+                         f"{len(gaps)} CRSP month(s): {gaps[:12]}")
+
     df["below_nyse_p10"] = df["MthCap"] < df["nyse_p10"]
-    n_flag = int(df["below_nyse_p10"].sum())
-    _note(f"[info] Micro-cap flag: {n_flag:,} firm-months below NYSE p{NYSE_PCTILE} "
-          f"(DROP_MICROCAPS={DROP_MICROCAPS}).")
-    if DROP_MICROCAPS:
-        df = df[~df["below_nyse_p10"]].copy()
-        _note(f"[info] Micro-caps dropped -> {len(df):,} rows.")
+    below_internal = df["MthCap"] < df["nyse_p10_internal"]
+    n_fr, n_int, n = int(df["below_nyse_p10"].sum()), int(below_internal.sum()), len(df)
+    _note(f"[info] Micro-cap breakpoint sources over {n:,} firm-months: internal "
+          f"p{NYSE_PCTILE} flags {n_int:,} ({n_int / n:.1%}), French p{NYSE_PCTILE} flags "
+          f"{n_fr:,} ({n_fr / n:.1%}); agreement "
+          f"{(df['below_nyse_p10'] == below_internal).mean():.2%}; mean threshold ratio "
+          f"internal/French {(df['nyse_p10_internal'] / df['nyse_p10']).mean():.3f}.")
+
+    if not DROP_MICROCAPS:
+        _note(f"[info] Micro-caps flagged only (DROP_MICROCAPS=False).")
+        return df
+    n_permno = df["PERMNO"].nunique()
+    df = df[~df["below_nyse_p10"]].copy()
+    _note(f"[info] Micro-caps dropped on French p{NYSE_PCTILE}: {n:,} -> {len(df):,} "
+          f"firm-months, {n_permno:,} -> {df['PERMNO'].nunique():,} PERMNOs.")
     return df
 
 
@@ -291,10 +358,11 @@ def export_returns(ce: pd.DataFrame) -> pd.DataFrame:
         "MthCalDt": "superseded by canonical month-end 'date'",
         "MthPrc": "replaced by absolute-valued 'prc'",
         "nyse_p10": "intermediate breakpoint threshold; not needed downstream",
+        "nyse_p10_internal": "diagnostic only (internal-vs-French breakpoint comparison)",
         "ShrOut": "redundant (me = prc x shrout)",
         "Ticker": "not needed; permno is the join key",
     }
-    panel = pd.DataFrame({
+    cols = {
         "permno": ce["PERMNO"],
         "date": to_month_end(ce["MthCalDt"]),
         "ret": ce["MthRet"],
@@ -302,8 +370,12 @@ def export_returns(ce: pd.DataFrame) -> pd.DataFrame:
         "prc": ce["price"],
         "siccd": ce["SICCD"],
         "primaryexch": ce["PrimaryExch"],
-        "below_nyse_p10": ce["below_nyse_p10"],
-    }).sort_values(["permno", "date"]).reset_index(drop=True)
+    }
+    if DROP_MICROCAPS:
+        dropped["below_nyse_p10"] = "constant False after the micro-cap drop"
+    else:
+        cols["below_nyse_p10"] = ce["below_nyse_p10"]
+    panel = pd.DataFrame(cols).sort_values(["permno", "date"]).reset_index(drop=True)
 
     for col, reason in dropped.items():
         _note(f"[drop] returns.{col}: {reason}")
@@ -393,9 +465,15 @@ def print_assumptions() -> None:
         "(NS & EQTY & COM & USInc=Y & IssuerType in {ACOR,CORP}); excludes REITs/funds/ADRs.",
         "Observation date = MthCalDt (ISO month-end); YYYYMM used only as a cross-check key.",
         f"Price filter uses abs(MthPrc) > {PRICE_MIN} (CRSP negative = bid/ask average, not missing).",
-        f"NYSE micro-cap breakpoint = per-month {NYSE_PCTILE}th pct of MthCap over "
-        "PrimaryExch=='N' common-equity firms (computed internally, Fama-French style); "
-        f"flag only unless DROP_MICROCAPS=True.",
+        f"NYSE micro-cap breakpoint = official Ken French NYSE ME series ({ME_BP_FILE.name}, "
+        f"field {ME_BP_P10_FIELD} = p{NYSE_PCTILE}), merged on the month-end date; French "
+        f"quotes $millions and CRSP MthCap is $thousands, so the level is scaled "
+        f"x{ME_BP_SCALE:,.0f}.",
+        f"DROP_MICROCAPS={DROP_MICROCAPS}: firm-months below the breakpoint are dropped. "
+        "The screen is applied per firm-month, so firms crossing the breakpoint have gaps "
+        "rather than being excluded wholesale.",
+        "The internally-computed p10 is retained as a diagnostic only (both classifications "
+        "reported for comparison); the French series governs the drop.",
         "Link table filtered to LINKPRIM in {P,C}; LINKTYPE already LC/LU at query time.",
         "LINKENDDT 'E' (still active) mapped to open-ended validity.",
         "Bridge is long: one row per valid PERMNO-GVKEY-CIK link interval; "
@@ -420,7 +498,7 @@ def main() -> pd.DataFrame:
     crsp = load_crsp()
     ce = filter_common_equity(crsp)
     ce = apply_price_filter(ce)
-    ce = flag_microcaps(ce)
+    ce = flag_microcaps(ce, load_nyse_breakpoints())
     export_returns(ce)
     link = load_link()
     bridge = build_bridge(ce, link)
