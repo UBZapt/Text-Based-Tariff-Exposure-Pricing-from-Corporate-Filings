@@ -59,6 +59,7 @@ id_rsa
 # --- CLAUDE.md-mandated minimums ---
 output/
 logs/*.tmp
+logs/
 
 # --- OS / editor cruft & office lock files ---
 ~$*

@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
 LOG_CSV = BASE / "edgar_pull_log.csv"
+FILINGS_DIR = BASE / "filings_raw"     # must match edgar_pull.FILINGS_DIR
 CLEAN_OUT = BASE / "clean_filings.parquet"
 
 PARSER = "lxml"          # pinned: html.parser builds a different tree on malformed markup
@@ -71,11 +72,12 @@ def load_filings(log: pd.DataFrame) -> pd.DataFrame:
     """Select successfully-pulled filings whose cached HTML is present on disk.
 
     Takes the already-read log so callers holding it do not re-read the file. Log
-    rows whose file was pruned (firm no longer in the universe) are skipped.
+    rows whose file was pruned (firm no longer in the universe) are skipped. Files are
+    resolved by name under FILINGS_DIR so log rows written on either OS resolve alike.
     """
     ok = log[log["found_10k"].astype(str).str.strip().str.lower() == "true"].copy()
     ok["source_path"] = ok["local_path"].astype(str).str.replace("\\", "/", regex=False)
-    ok["path"] = [BASE / p for p in ok["source_path"]]
+    ok["path"] = [FILINGS_DIR / p.rsplit("/", 1)[-1] for p in ok["source_path"]]
     present = ok[[p.exists() for p in ok["path"]]].copy()
     if present.empty:
         raise FileNotFoundError(
