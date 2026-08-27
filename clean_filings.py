@@ -14,6 +14,7 @@ steps). Runs standalone:
 """
 
 import re
+import time
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -29,9 +30,12 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
+CLEAN_DIR = BASE / "clean_data"
+OUTPUT_DIR = BASE / "output"
 LOG_CSV = BASE / "edgar_pull_log.csv"
 FILINGS_DIR = BASE / "filings_raw"     # must match edgar_pull.FILINGS_DIR
-CLEAN_OUT = BASE / "clean_filings.parquet"
+CLEAN_OUT = CLEAN_DIR / "clean_filings.parquet"
+DIAG_OUT = OUTPUT_DIR / "cleaning_diagnostics.csv"
 
 PARSER = "lxml"          # pinned: html.parser builds a different tree on malformed markup
 FORM_TYPE = "10-K"       # constant by construction (edgar_pull.select_10k matches exactly)
@@ -53,6 +57,8 @@ ITEM_1A_START = re.compile(
 ITEM_1A_END = re.compile(rf"(?im)^\s*{_PART}item\s*(?:1b|1c|2)\b")
 
 SHORT_ITEM_1A_CHARS = 2000
+PROGRESS_EVERY = 100                  # filings between progress/ETA lines
+MAX_LISTED = 10                       # identities printed before deferring to the audit CSV
 MARKUP_ARTIFACT_RE = re.compile(r"<[a-zA-Z/!]|&nbsp;|&#\d+;|&amp;|&lt;|&gt;|&quot;")
 # A lone-letter line signals a word split across inline spans. Roman numerals are
 # excluded: front-matter page numbers ("i") are legitimate content, not shattering.
@@ -205,9 +211,13 @@ def split_item_1a(text: str) -> tuple[str, str, bool, list[str]]:
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
 def clean_all(filings: pd.DataFrame) -> pd.DataFrame:
-    """Clean and split every filing, returning one row per filing."""
-    rows = []
-    for f in filings.itertuples(index=False):
+    """Clean and split every filing, returning one row per filing.
+
+    Progress is periodic rather than per filing: at full-corpus scale a per-filing line is
+    ~3,000 lines of noise, while a ~20-minute job needs an ETA.
+    """
+    rows, total, n_found, t0 = [], len(filings), 0, time.monotonic()
+    for i, f in enumerate(filings.itertuples(index=False), 1):
         flags = []
         try:
             text, n_heading_tables, n_boilerplate = clean_filing(f.path)
@@ -222,6 +232,7 @@ def clean_all(filings: pd.DataFrame) -> pd.DataFrame:
             text, item_1a, rest, found = "", "", "", False
             flags = [f"cleaning_failed: {type(exc).__name__}"]
 
+        n_found += found
         period = str(f.period_of_report)
         rows.append({
             "permno": f.permno,
@@ -240,15 +251,55 @@ def clean_all(filings: pd.DataFrame) -> pd.DataFrame:
             "cleaning_flags": "; ".join(flags),
             "source_path": f.source_path,
         })
-        print(f"  {f.permno:<7} cik={f.cik} "
-              f"{'1A ' + format(len(item_1a), ',') + ' ch' if found else 'ITEM 1A NOT FOUND':<18} "
-              f"rest={len(rest):,} ch")
+        if i % PROGRESS_EVERY == 0 or i == total:
+            elapsed = time.monotonic() - t0
+            print(f"[progress] {i:,}/{total:,} ({i / total:.1%}) | Item 1A found "
+                  f"{n_found:,} ({n_found / i:.1%}) | {elapsed / 60:.1f} min elapsed | "
+                  f"ETA {(total - i) * elapsed / i / 60:.0f} min", flush=True)
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
 
 
 # --------------------------------------------------------------------------- #
 # Validation                                                                  #
 # --------------------------------------------------------------------------- #
+def _listed(sub: pd.DataFrame) -> str:
+    """Format filing identities for the console, capped so a full-corpus run stays readable."""
+    if sub.empty:
+        return ""
+    ids = [f"{r.cik}/{r.accession}" for r in sub.head(MAX_LISTED).itertuples(index=False)]
+    more = len(sub) - len(ids)
+    return " ".join(ids) + (f" (+{more} more, see {DIAG_OUT.name})" if more else "")
+
+
+def _scan_text(df: pd.DataFrame) -> tuple[list[int], int]:
+    """Scan for residual markup and shattered words one filing at a time.
+
+    Concatenating the corpus into a single Series copies ~1 GB of text for two regex passes;
+    scanning per filing bounds the cost by the largest single filing instead. Returns the
+    positional indices of filings holding markup artifacts, and the total lone-letter count.
+    """
+    artifact_rows, shattered = [], 0
+    for i, r in enumerate(df.itertuples(index=False)):
+        both = r.item_1a_text + "\n" + r.rest_text
+        if MARKUP_ARTIFACT_RE.search(both):
+            artifact_rows.append(i)
+        shattered += len(SHATTERED_WORD_RE.findall(both))
+    return artifact_rows, shattered
+
+
+def write_diagnostics(df: pd.DataFrame) -> Path:
+    """Write the per-filing audit table: the output schema minus the two text columns.
+
+    At full-corpus scale the console cannot carry one line per dropped or flagged filing, so
+    the identities live here and the console reports counts plus the first few.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    diag = df.drop(columns=["item_1a_text", "rest_text"])
+    diag.to_csv(DIAG_OUT, index=False)
+    print(f"Wrote {DIAG_OUT.relative_to(BASE)} ({len(diag):,} rows) - per-filing cleaning audit.")
+    return DIAG_OUT
+
+
 def validate(df: pd.DataFrame) -> dict:
     """Run the required output checks and print the report.
 
@@ -256,42 +307,37 @@ def validate(df: pd.DataFrame) -> dict:
     Item 1A sections, outright cleaning failures, and a regression guard on the
     inline-span word-shattering that a naive text extraction produces.
     """
-    def identities(sub):
-        return [(r.cik, r.accession) for r in sub.itertuples(index=False)]
-
-    both = df["item_1a_text"] + "\n" + df["rest_text"]
-    artifacts = df[both.str.contains(MARKUP_ARTIFACT_RE, regex=True)]
+    artifact_rows, shattered = _scan_text(df)
+    artifacts = df.iloc[artifact_rows]
     failed = df[df["cleaning_flags"].str.startswith("cleaning_failed")]
     missing = df[~df["item_1a_found"]]
     short = df[df["cleaning_flags"].str.contains("short_item_1a")]
-    shattered = int(both.str.count(SHATTERED_WORD_RE).sum())
     empty_rest = df[df["rest_char_count"] == 0]
 
     print("\n" + "=" * 70)
     print("VALIDATION")
     print("=" * 70)
-    print(f"Filings cleaned            : {len(df)}")
-    print(f"Failed cleaning entirely   : {len(failed)} {identities(failed) or ''}")
-    print(f"Residual markup artifacts  : {len(artifacts)} {identities(artifacts) or ''}")
-    print(f"Shattered-word artifacts   : {shattered} lone-letter lines")
-    print(f"Empty rest_text            : {len(empty_rest)} {identities(empty_rest) or ''}")
-    print(f"Item 1A located            : {len(df) - len(missing)}/{len(df)} "
+    print(f"Filings cleaned            : {len(df):,}")
+    print(f"Failed cleaning entirely   : {len(failed):,} {_listed(failed)}")
+    print(f"Residual markup artifacts  : {len(artifacts):,} {_listed(artifacts)}")
+    print(f"Shattered-word artifacts   : {shattered:,} lone-letter lines")
+    print(f"Empty rest_text            : {len(empty_rest):,} {_listed(empty_rest)}")
+    print(f"Item 1A located            : {len(df) - len(missing):,}/{len(df):,} "
           f"({(df['item_1a_found'].mean() if len(df) else 0):.1%})")
     if len(missing):
-        print("  not found:")
-        for cik, acc in identities(missing):
-            print(f"    cik={cik} accession={acc}")
-    print(f"Short Item 1A (<{SHORT_ITEM_1A_CHARS:,} ch) : {len(short)} {identities(short) or ''}")
+        print(f"  not found                : {_listed(missing)}")
+    print(f"Short Item 1A (<{SHORT_ITEM_1A_CHARS:,} ch) : {len(short):,} {_listed(short)}")
 
     by_year = df.groupby("fiscal_year")["item_1a_found"].agg(["sum", "count"])
     print("\nItem 1A detection by fiscal year:")
     for year, r in by_year.iterrows():
-        print(f"  FY{year}: {int(r['sum'])}/{int(r['count'])}")
-    print("  (single-vintage sample: the 2018-era EDGAR format is not represented "
-          "in this cache, so vintage robustness is untested)")
+        print(f"  FY{year}: {int(r['sum']):,}/{int(r['count']):,}")
+    print("  (single-vintage cache: the 2018-era EDGAR format is not represented here, "
+          "so vintage robustness is untested)")
 
     if len(df):
-        print(f"\nItem 1A chars: median {df.loc[df['item_1a_found'], 'item_1a_char_count'].median():,.0f}"
+        print(f"\nItem 1A chars: median "
+              f"{df.loc[df['item_1a_found'], 'item_1a_char_count'].median():,.0f}"
               f" | rest chars: median {df['rest_char_count'].median():,.0f}")
     return {
         "n_filings": len(df), "n_failed": len(failed), "n_artifacts": len(artifacts),
@@ -308,8 +354,10 @@ def main() -> pd.DataFrame:
     print(f"Cleaning {len(filings)} cached filings from {LOG_CSV.name}\n")
 
     df = clean_all(filings)
+    CLEAN_DIR.mkdir(exist_ok=True)
     df.to_parquet(CLEAN_OUT, index=False)
-    print(f"\nWrote {CLEAN_OUT.name} ({len(df)} rows x {len(df.columns)} cols).")
+    print(f"\nWrote {CLEAN_OUT.relative_to(BASE)} ({len(df):,} rows x {len(df.columns)} cols).")
+    write_diagnostics(df)
     validate(df)
     return df
 

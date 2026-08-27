@@ -23,16 +23,17 @@ import pandas as pd
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
+CLEAN_DIR = BASE / "clean_data"               # cleaned panels consumed downstream
 CRSP_FILE = BASE / "Monthly Returns.csv"
 LINK_FILE = BASE / "PERMNO - GVKEY - CIK.csv"
 GEO_FILE = BASE / "Compustat Geographic segment data.csv"  # not touched in this task
 FF_FILE = BASE / "FF5_MOM_Factors.csv"
 EPU_FILE = BASE / "US_Policy_Uncertainty_Data.xlsx"
 ME_BP_FILE = BASE / "ME_Breakpoints.csv"      # Ken French NYSE ME breakpoints
-BRIDGE_OUT = BASE / "clean_firm_bridge.csv"
-RETURNS_OUT = BASE / "clean_returns.csv"
-FF_OUT = BASE / "clean_ff5_mom.csv"
-EPU_OUT = BASE / "clean_epu.csv"
+BRIDGE_OUT = CLEAN_DIR / "clean_firm_bridge.csv"
+RETURNS_OUT = CLEAN_DIR / "clean_returns.csv"
+FF_OUT = CLEAN_DIR / "clean_ff5_mom.csv"
+EPU_OUT = CLEAN_DIR / "clean_epu.csv"
 
 EPU_SHEET = "Main News Index"                 # sheet holding the chosen EPU series
 EPU_VALUE_COL = "News_Based_Policy_Uncert_Index"  # chosen EPU variant (user decision)
@@ -494,6 +495,7 @@ def print_assumptions() -> None:
 # Pipeline                                                                     #
 # --------------------------------------------------------------------------- #
 def main() -> pd.DataFrame:
+    CLEAN_DIR.mkdir(exist_ok=True)
     inspect_dates()
     crsp = load_crsp()
     ce = filter_common_equity(crsp)

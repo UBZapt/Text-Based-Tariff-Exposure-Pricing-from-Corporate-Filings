@@ -18,7 +18,8 @@
 *.gz
 *.tar
 *.7z
-# Pipeline outputs derived from licensed data (redundant with *.csv, kept explicit)
+# Pipeline outputs derived from licensed data (redundant with *.csv/*.parquet, kept explicit)
+clean_data/
 clean_firm_bridge.csv
 edgar_pull_log.csv
 

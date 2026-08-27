@@ -58,8 +58,11 @@ def _load_dotenv(path: Path) -> None:
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
-BRIDGE_CSV = BASE / "clean_firm_bridge.csv"
+CLEAN_DIR = BASE / "clean_data"
+BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
 FILINGS_DIR = BASE / "filings_raw"
+# The pull log is resumable pull state paired with FILINGS_DIR, not an analysis output, so it
+# stays beside the cache: if it cannot be found, every CIK reads as incomplete and re-pulls.
 LOG_CSV = BASE / "edgar_pull_log.csv"
 
 # SEC fair access requires a descriptive User-Agent "AppName ContactEmail".
