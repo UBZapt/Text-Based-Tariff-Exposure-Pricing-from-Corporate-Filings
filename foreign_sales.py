@@ -12,7 +12,7 @@ The segment file carries no company-total row (geotp is only 2/3 plus non-geogra
 rows), so the denominator is built from every row in the firm-datadate group and the
 domestic + foreign vs total reconciliation is reported per firm-year as recon_gap.
 
-Reads clean_data/tariff_scores.parquet; the scoring pipeline itself is not touched.
+Reads clean_data/tariff_scores.csv; the scoring pipeline itself is not touched.
 
     python foreign_sales.py
 """
@@ -34,8 +34,12 @@ CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
 SEGMENT_FILE = BASE / "Compustat Geographic segment data.csv"
 BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
-SCORES_PARQUET = CLEAN_DIR / "tariff_scores.parquet"
-FS_OUT = CLEAN_DIR / "foreign_sales_share.parquet"
+SCORES_CSV = CLEAN_DIR / "tariff_scores.csv"
+FS_OUT = CLEAN_DIR / "foreign_sales_share.csv"
+# CSV rather than Parquet throughout: Smart App Control blocks pyarrow's DLLs (build_notes 4b).
+# cik and accession must come back as strings or their zero padding is lost, exactly as gvkey
+# would be - the failure this module already documents for the unpadded segment export.
+SCORES_READ_DTYPES = {"cik": str, "accession": str, "scoring_flags": str}
 SCATTER_OUT = OUTPUT_DIR / "texp_fs_scatter.png"
 REPORT_OUT = OUTPUT_DIR / "fs_validation_report.txt"
 
@@ -508,7 +512,7 @@ def write_report(seg: pd.DataFrame, kept: pd.DataFrame, lost: pd.DataFrame,
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
 def main() -> pd.DataFrame:
-    for path in (BRIDGE_CSV, SCORES_PARQUET):
+    for path in (BRIDGE_CSV, SCORES_CSV):
         if not path.exists():
             raise FileNotFoundError(f"{path.name} not found; run the upstream pipeline first.")
 
@@ -521,11 +525,12 @@ def main() -> pd.DataFrame:
     bridge = pd.read_csv(BRIDGE_CSV, dtype=str)
     linked, link_stats = link_permno(fs, bridge)
 
-    scores = pd.read_parquet(SCORES_PARQUET)
+    scores = pd.read_csv(SCORES_CSV, dtype=SCORES_READ_DTYPES)
+    scores["scoring_flags"] = scores["scoring_flags"].fillna("")
     merged = merge_texp(linked, scores)
 
     CLEAN_DIR.mkdir(exist_ok=True)
-    linked.reindex(columns=OUTPUT_COLUMNS).to_parquet(FS_OUT, index=False)
+    linked.reindex(columns=OUTPUT_COLUMNS).to_csv(FS_OUT, index=False)
 
     corr = correlations(merged)
     fit = plot_scatter(merged)

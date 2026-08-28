@@ -28,6 +28,7 @@ from typing import NamedTuple
 import nltk
 import pandas as pd
 
+import clean_filings
 import edgar_pull
 
 # --------------------------------------------------------------------------- #
@@ -36,9 +37,9 @@ import edgar_pull
 BASE = Path(__file__).resolve().parent
 CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
-FILINGS_PARQUET = CLEAN_DIR / "clean_filings.parquet"
 BIGRAM_JSON = BASE / "bigram_list.json"
-SCORES_OUT = CLEAN_DIR / "tariff_scores.parquet"
+SCORES_OUT = CLEAN_DIR / "tariff_scores.csv"
+# The cleaned-filings path and its read dtypes are owned by clean_filings, which writes it.
 DIAG_OUT = OUTPUT_DIR / "scoring_diagnostics.csv"
 TERM_HITS_OUT = OUTPUT_DIR / "term_hits.csv"
 
@@ -213,7 +214,7 @@ def load_scope(filings: pd.DataFrame,
     kept = remaining[found].copy()
 
     if kept.empty:
-        raise ValueError(f"No filings in {FILINGS_PARQUET.name} survive the scope, fiscal-year "
+        raise ValueError(f"No filings in {clean_filings.CLEAN_OUT.name} survive the scope, fiscal-year "
                          f"{FISCAL_YEARS} and Item 1A filters.")
     return kept, pd.concat(stages, ignore_index=True)
 
@@ -473,7 +474,7 @@ def _check_funnel(filings: pd.DataFrame, kept: pd.DataFrame, dropped: pd.DataFra
 
 
 def _check_drop_reconciliation(dropped: pd.DataFrame) -> None:
-    """Cross-check the three parquet fields that independently record a missing Item 1A."""
+    """Cross-check the three fields that independently record a missing Item 1A."""
     no_1a = dropped[dropped["drop_reason"] == "item_1a_not_found"]
     by_flag = set(no_1a.loc[no_1a["cleaning_flags"].str.contains("item_1a_not_found"),
                             "accession"])
@@ -723,16 +724,13 @@ def main() -> pd.DataFrame:
                          "(default: the whole universe)")
     args = ap.parse_args()
 
-    if not FILINGS_PARQUET.exists():
-        raise FileNotFoundError(
-            f"{FILINGS_PARQUET.name} not found; run clean_filings.py first.")
     resource = ensure_punkt()
     terms = load_bigrams(BIGRAM_JSON)
     patterns, gates = compile_patterns(terms), build_gates(terms)
     print(f"Tokenizer data: NLTK '{resource}' | terms: {len(terms)} "
           f"from {BIGRAM_JSON.name} | fiscal years: {FISCAL_YEARS}\n")
 
-    filings = pd.read_parquet(FILINGS_PARQUET)
+    filings = clean_filings.read_clean_filings()   # raises if the upstream step has not run
     scope_ciks = resolve_scope_ciks(args.n_ciks)
     kept, dropped = load_scope(filings, scope_ciks)
     print(f"Scope: {'whole universe' if args.n_ciks is None else f'first {args.n_ciks} CIKs'} "
@@ -744,7 +742,7 @@ def main() -> pd.DataFrame:
     audit = audit_removed_terms(tokenised)
 
     CLEAN_DIR.mkdir(exist_ok=True)
-    scores.to_parquet(SCORES_OUT, index=False)
+    scores.to_csv(SCORES_OUT, index=False)
     print(f"Wrote {SCORES_OUT.relative_to(BASE)} "
           f"({len(scores):,} rows x {len(scores.columns)} cols).")
     write_diagnostics(scores, dropped)

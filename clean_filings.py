@@ -34,8 +34,17 @@ CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
 LOG_CSV = BASE / "edgar_pull_log.csv"
 FILINGS_DIR = BASE / "filings_raw"     # must match edgar_pull.FILINGS_DIR
-CLEAN_OUT = CLEAN_DIR / "clean_filings.parquet"
+CLEAN_OUT = CLEAN_DIR / "clean_filings.csv"
 DIAG_OUT = OUTPUT_DIR / "cleaning_diagnostics.csv"
+
+# CSV rather than Parquet: Windows Smart App Control (Enforcement) blocks pyarrow's unsigned
+# native DLLs, so no Parquet file on this machine can be read. See build_notes.md Step 4b.
+# Identifier columns must be read back as strings or their zero padding is silently lost, and
+# the text/flag columns must not become NaN when a filing legitimately holds an empty string.
+READ_DTYPES = {"cik": str, "accession": str, "form_type": str, "filing_date": str,
+               "period_of_report": str, "item_1a_text": str, "rest_text": str,
+               "cleaning_flags": str, "source_path": str}
+FILL_EMPTY_COLUMNS = ["item_1a_text", "rest_text", "cleaning_flags"]
 
 PARSER = "lxml"          # pinned: html.parser builds a different tree on malformed markup
 FORM_TYPE = "10-K"       # constant by construction (edgar_pull.select_10k matches exactly)
@@ -346,6 +355,46 @@ def validate(df: pd.DataFrame) -> dict:
     }
 
 
+def read_clean_filings(path: Path = CLEAN_OUT) -> pd.DataFrame:
+    """Read the cleaned-filings CSV with the dtypes Parquet used to carry for free.
+
+    Shared with score_filings so the padding and empty-string rules live once, beside the
+    writer. Without the dtype map cik loses its zero padding and every downstream CIK match
+    silently fails; without the fillna an empty section reads back as NaN and the sentence
+    tokeniser crashes on it.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"{path.name} not found; run clean_filings.py first.")
+    df = pd.read_csv(path, dtype=READ_DTYPES)
+    for col in FILL_EMPTY_COLUMNS:
+        df[col] = df[col].fillna("")
+    return df
+
+
+def verify_roundtrip(df: pd.DataFrame) -> dict:
+    """Prove the CSV write preserved every character of the extracted text.
+
+    Each row already records its own section lengths, so re-reading and comparing those counts
+    against the strings that came back is a direct test that ~940 MB of prose containing
+    newlines, commas and quotes survived CSV quoting intact. This is the one check that would
+    catch a lossy format migration, so it runs on every row rather than a sample.
+    """
+    back = read_clean_filings()
+    if len(back) != len(df):
+        raise ValueError(f"CSV round-trip lost rows: wrote {len(df):,}, read back {len(back):,}")
+    bad = {col: int((back[col].str.len() != back[count]).sum())
+           for col, count in (("item_1a_text", "item_1a_char_count"),
+                              ("rest_text", "rest_char_count"))}
+    if any(bad.values()):
+        raise ValueError(f"CSV round-trip altered text; rows whose length no longer matches "
+                         f"its recorded character count: {bad}")
+    widths = set(back["cik"].str.len().unique())
+    if widths != {10}:
+        raise ValueError(f"cik lost its zero padding on re-read; widths found: {sorted(widths)}")
+    return {"rows": len(back), "chars_verified": int(back["item_1a_char_count"].sum()
+                                                     + back["rest_char_count"].sum())}
+
+
 def main() -> pd.DataFrame:
     if not LOG_CSV.exists():
         raise FileNotFoundError(f"{LOG_CSV.name} not found; run edgar_pull.py first.")
@@ -355,8 +404,13 @@ def main() -> pd.DataFrame:
 
     df = clean_all(filings)
     CLEAN_DIR.mkdir(exist_ok=True)
-    df.to_parquet(CLEAN_OUT, index=False)
-    print(f"\nWrote {CLEAN_OUT.relative_to(BASE)} ({len(df):,} rows x {len(df.columns)} cols).")
+    df.to_csv(CLEAN_OUT, index=False)
+    size_mb = CLEAN_OUT.stat().st_size / 1e6
+    print(f"\nWrote {CLEAN_OUT.relative_to(BASE)} "
+          f"({len(df):,} rows x {len(df.columns)} cols, {size_mb:,.0f} MB).")
+    rt = verify_roundtrip(df)
+    print(f"Round-trip verified: {rt['rows']:,} rows, "
+          f"{rt['chars_verified']:,} characters of text intact, cik padding preserved.")
     write_diagnostics(df)
     validate(df)
     return df
