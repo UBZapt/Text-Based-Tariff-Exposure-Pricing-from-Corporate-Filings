@@ -15,14 +15,19 @@ No text parsing, tokenization, or scoring is performed here (that is Step 2).
 
 import io
 import re
+import argparse
 from pathlib import Path
 
 import pandas as pd
+
+import run_report
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE / "output"
+REPORT_OUT = OUTPUT_DIR / "source_cleaning_validation_report.txt"
 CLEAN_DIR = BASE / "clean_data"               # cleaned panels consumed downstream
 CRSP_FILE = BASE / "Monthly Returns.csv"
 LINK_FILE = BASE / "PERMNO - GVKEY - CIK.csv"
@@ -391,7 +396,10 @@ def clean_ff5_mom() -> pd.DataFrame:
 
     Standardises the date, verifies the percent-vs-decimal convention (converting
     only if needed), and maps any missing-value sentinels to NaN. rf is retained
-    because the research design needs it for Sharpe and excess-return computation.
+    because the abnormal-return pipeline needs it: estimate_car forms excess returns as
+    r - rf before fitting FF5+MOM loadings. The v5 design also cited Sharpe-ratio
+    computation, which v6 retires along with the long-short portfolio; the excess-return
+    use is what keeps rf here.
     """
     factors = ["mktrf", "smb", "hml", "rmw", "cma", "rf", "umd"]
     ff = pd.read_csv(FF_FILE)
@@ -414,7 +422,7 @@ def clean_ff5_mom() -> pd.DataFrame:
     out = ff[["date"] + factors].sort_values("date").reset_index(drop=True)
     out.to_csv(FF_OUT, index=False)
     _note(f"[info] Wrote {FF_OUT.name} ({len(out):,} rows; cols={list(out.columns)}; "
-          f"rf retained for Sharpe/excess returns).")
+          f"rf retained for excess returns).")
     return out
 
 
@@ -483,7 +491,8 @@ def print_assumptions() -> None:
         "All monthly panels (returns/FF/EPU) share a calendar month-end Timestamp 'date' as the "
         "uniform join key; CRSP MthCalDt and FF dateff (last trading day) are normalised to it.",
         "FF5+MOM values are decimals (not percent) - no /100 conversion; no missing sentinels present.",
-        "clean_ff5_mom retains rf (risk-free) for Sharpe / excess-return computation.",
+        "clean_ff5_mom retains rf (risk-free) for excess-return computation in estimate_car; "
+        "v6 retires the Sharpe ratio the v5 design also cited it for.",
         "EPU = News-Based index (Main News Index sheet) per user decision; "
         "other variants reported, not silently dropped.",
     ]:
@@ -494,7 +503,40 @@ def print_assumptions() -> None:
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                     #
 # --------------------------------------------------------------------------- #
-def main() -> pd.DataFrame:
+def _up_to_date(outputs, label: str, force: bool) -> bool:
+    """True when every output already exists and the caller has not passed --force.
+
+    Cleaning is deterministic in its inputs, so re-deriving an output that is already on disk
+    costs I/O and produces the same bytes. The stages that stream per document (clean_filings,
+    score_filings) have always resumed; this gives the whole-file stages the same courtesy, with
+    an explicit override rather than an implicit one.
+    """
+    missing = [p for p in outputs if not p.exists()]
+    if force or missing:
+        if missing and not force:
+            print(f"{label}: rebuilding - missing "
+                  f"{', '.join(p.name for p in missing)}")
+        return False
+    print(f"{label}: already built, not regenerated. Outputs:")
+    for p in outputs:
+        print(f"  {p.name}  ({p.stat().st_size / 1e6:,.1f} MB)")
+    print("  Pass --force to rebuild.")
+    return True
+
+
+def main(argv: list[str] | None = None) -> pd.DataFrame | None:
+    ap = argparse.ArgumentParser(description="Clean the CRSP, CCM, factor and EPU sources.")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild the cleaned files even if they already exist")
+    args = ap.parse_args(argv)
+    outputs = [RETURNS_OUT, BRIDGE_OUT, FF_OUT, EPU_OUT]
+    if _up_to_date(outputs, "clean_data", args.force):
+        return None
+    with run_report.capture(REPORT_OUT, title="STEP 1 - SOURCE DATA CLEANING VALIDATION"):
+        return _run()
+
+
+def _run() -> pd.DataFrame:
     CLEAN_DIR.mkdir(exist_ok=True)
     inspect_dates()
     crsp = load_crsp()

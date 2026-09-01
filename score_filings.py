@@ -39,6 +39,7 @@ import pandas as pd
 
 import clean_filings
 import edgar_pull
+import run_report
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
@@ -49,8 +50,10 @@ OUTPUT_DIR = BASE / "output"
 BIGRAM_JSON = BASE / "bigram_list.json"
 SCORES_OUT = CLEAN_DIR / "tariff_scores.csv"
 # The cleaned-filings path and its read dtypes are owned by clean_filings, which writes it.
-DIAG_OUT = OUTPUT_DIR / "scoring_diagnostics.csv"
+INTERMEDIATE_DIR = BASE / "intermediate"   # per-document audit table, not a reported result
+DIAG_OUT = INTERMEDIATE_DIR / "scoring_diagnostics.csv"
 TERM_HITS_OUT = OUTPUT_DIR / "term_hits.csv"
+REPORT_OUT = OUTPUT_DIR / "scoring_validation_report.txt"
 
 # Contemporaneity is NOT enforced here any more. Scoring is a property of the document, so it
 # runs once per accession and cannot know which reference date will use the result; the
@@ -467,7 +470,7 @@ def write_diagnostics(scores: pd.DataFrame, dropped: pd.DataFrame) -> Path:
     At full-corpus scale the console cannot carry one line per dropped or flagged filing, so
     the identities live here and the console reports counts plus the first few.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(exist_ok=True)
     keys = ["permno", "cik", "accession", "filing_date", "fiscal_year", "drop_reason"]
     diag = pd.concat([scores.assign(drop_reason=""), dropped.reindex(columns=keys)],
                      ignore_index=True)
@@ -821,7 +824,14 @@ def main() -> pd.DataFrame | None:
         print(dropped["drop_reason"].value_counts().to_string())
         return None
     if kept.empty:
-        print("Nothing to score.")
+        # A fully scored corpus still re-emits its diagnostics and report. Returning here left
+        # an idempotent re-run with no record of the stage and stale diagnostic files.
+        print("Nothing to score; re-validating the existing scores.")
+        full = pd.read_csv(SCORES_OUT, dtype={"cik": str, "accession": str})
+        write_diagnostics(full, dropped)
+        with run_report.capture(REPORT_OUT, title="STEP 2B - TARIFF SCORING VALIDATION"):
+            print(f"Re-validation of {len(full):,} scored filings; nothing new to score.")
+            print(dropped["drop_reason"].value_counts().to_string())
         return None
 
     dropped_cols = align_scores_schema()
@@ -851,7 +861,8 @@ def main() -> pd.DataFrame | None:
     # Validated on this run's rows, not the whole file: the diag counters describe exactly
     # these filings, and pairing them with a corpus-wide row count would misstate every
     # per-term and per-filing rate on a resumed run.
-    validate(scores, filings, kept, dropped, scope_ciks, terms, diag, done)
+    with run_report.capture(REPORT_OUT, title="STEP 2B - TARIFF SCORING VALIDATION"):
+        validate(scores, filings, kept, dropped, scope_ciks, terms, diag, done)
     return scores
 
 

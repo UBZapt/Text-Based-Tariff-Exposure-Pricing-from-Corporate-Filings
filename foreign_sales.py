@@ -18,12 +18,14 @@ not touched.
     python foreign_sales.py
 """
 
+import argparse
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import palette
 import pandas as pd
 from scipy import stats
 
@@ -79,14 +81,7 @@ OUTPUT_COLUMNS = [
     "n_foreign_segments", "domestic_sales_missing", "recon_gap",
 ]
 
-PALETTE = {                       # dataviz reference palette, light surface
-    "surface": "#fcfcfb",
-    "points": "#2a78d6",          # categorical slot 1
-    "fit": "#eb6834",             # categorical slot 2
-    "ink": "#0b0b0b",
-    "ink_muted": "#52514e",
-    "grid": "#dcdcd8",
-}
+PALETTE = palette.roles(points="CATEGORICAL_1", fit="CATEGORICAL_2")
 
 _REPORT: list[str] = []
 
@@ -544,7 +539,34 @@ def write_report(seg: pd.DataFrame, kept: pd.DataFrame, lost: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
-def main() -> pd.DataFrame:
+def _up_to_date(outputs, label: str, force: bool) -> bool:
+    """True when every output already exists and the caller has not passed --force.
+
+    Cleaning is deterministic in its inputs, so re-deriving an output that is already on disk
+    costs I/O and produces the same bytes. The stages that stream per document (clean_filings,
+    score_filings) have always resumed; this gives the whole-file stages the same courtesy, with
+    an explicit override rather than an implicit one.
+    """
+    missing = [p for p in outputs if not p.exists()]
+    if force or missing:
+        if missing and not force:
+            print(f"{label}: rebuilding - missing "
+                  f"{', '.join(p.name for p in missing)}")
+        return False
+    print(f"{label}: already built, not regenerated. Outputs:")
+    for p in outputs:
+        print(f"  {p.name}  ({p.stat().st_size / 1e6:,.1f} MB)")
+    print("  Pass --force to rebuild.")
+    return True
+
+
+def main(argv: list[str] | None = None) -> pd.DataFrame | None:
+    ap = argparse.ArgumentParser(description="Foreign-sales share and the TExp-FS validation.")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild even if the outputs already exist")
+    args = ap.parse_args(argv)
+    if _up_to_date([FS_OUT, SCATTER_OUT, REPORT_OUT], "foreign_sales", args.force):
+        return None
     for path in (BRIDGE_CSV, TEXP_PANEL_CSV):
         if not path.exists():
             raise FileNotFoundError(f"{path.name} not found; run the upstream pipeline first.")

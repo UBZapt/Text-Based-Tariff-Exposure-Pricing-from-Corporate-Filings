@@ -31,6 +31,10 @@ from numpy.lib.stride_tricks import sliding_window_view
 BASE = Path(__file__).resolve().parent
 CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
+# Derived analytical panels and per-document diagnostics live here, not in output/.
+# output/ is for final results, validation reports and figures; these are inputs to a later
+# stage or per-row audit tables, and two of them are the largest files in the repo.
+INTERMEDIATE_DIR = BASE / "intermediate"
 
 MONTHLY_RAW_FILE = BASE / "Monthly Returns.csv"   # unscreened history, for the momentum control
 FUNDA_FILE = BASE / "BM and Lev.csv"
@@ -118,7 +122,7 @@ CYCLE = DEFAULT_CYCLE
 # Set by select_cycle(); declared here so the module reads top to bottom.
 DAILY_FILES: list[Path] = CYCLES[DEFAULT_CYCLE]["daily_files"]
 EVENT_DATES: dict[str, str] = CYCLES[DEFAULT_CYCLE]["events"]
-PANEL_OUT = OUTPUT_DIR / "controls_panel"        # extension added from OUTPUT_FORMAT
+PANEL_OUT = INTERMEDIATE_DIR / "controls_panel"  # extension added from OUTPUT_FORMAT
 REPORT_OUT = OUTPUT_DIR / "cleaning_validation_report.txt"
 
 
@@ -136,7 +140,7 @@ def select_cycle(name: str) -> dict:
     CYCLE = name
     DAILY_FILES = cycle["daily_files"]
     EVENT_DATES = cycle["events"]
-    PANEL_OUT = OUTPUT_DIR / f"controls_panel{cycle['suffix']}"
+    PANEL_OUT = INTERMEDIATE_DIR / f"controls_panel{cycle['suffix']}"
     REPORT_OUT = OUTPUT_DIR / f"cleaning_validation_report{cycle['suffix']}.txt"
     return cycle
 
@@ -770,7 +774,7 @@ def restrict_universe(daily: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
 # --------------------------------------------------------------------------- #
 def write_panel(daily: pd.DataFrame) -> Path:
     """Write the panel in the configured format."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(exist_ok=True)
     out = daily.reindex(columns=output_columns())
     path = PANEL_OUT.with_suffix(f".{OUTPUT_FORMAT}")
     if OUTPUT_FORMAT == "parquet":
@@ -1032,8 +1036,27 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
-def main(cycle: str = DEFAULT_CYCLE) -> pd.DataFrame:
+def _up_to_date(outputs, label: str, force: bool) -> bool:
+    """True when every output already exists and the caller has not passed --force."""
+    missing = [p for p in outputs if not p.exists()]
+    if force or missing:
+        if missing and not force:
+            print(f"{label}: rebuilding - missing {', '.join(p.name for p in missing)}")
+        return False
+    print(f"{label}: already built, not regenerated. Outputs:")
+    for p in outputs:
+        print(f"  {p.name}  ({p.stat().st_size / 1e6:,.1f} MB)")
+    print("  Pass --force to rebuild.")
+    return True
+
+
+def main(cycle: str = DEFAULT_CYCLE, force: bool = False) -> pd.DataFrame | None:
     select_cycle(cycle)
+    # Checked AFTER select_cycle: both outputs are cycle-suffixed, so the check has to run
+    # against the cycle actually requested rather than whichever was active on import.
+    panel_path = PANEL_OUT.with_suffix(f'.{OUTPUT_FORMAT}')
+    if _up_to_date([panel_path, REPORT_OUT], f'clean_controls_data --cycle {cycle}', force):
+        return None
     for path in (BRIDGE_CSV, MONTHLY_CSV):
         if not path.exists():
             raise FileNotFoundError(f"{path.name} not found; run clean_data.py first.")
@@ -1076,13 +1099,17 @@ def main(cycle: str = DEFAULT_CYCLE) -> pd.DataFrame:
     return daily
 
 
-def parse_args(argv: list[str] | None = None) -> str:
+def parse_args(argv: list[str] | None = None) -> tuple[str, bool]:
     """The --cycle selector, shared in shape with Scripts 2 and 3 and with edgar_pull."""
     ap = argparse.ArgumentParser(description="Controls panel for the section 7.2 event study.")
     ap.add_argument("--cycle", choices=sorted(CYCLES), default=DEFAULT_CYCLE,
                     help="policy cycle to build the panel for (default: %(default)s)")
-    return ap.parse_args(argv).cycle
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild the panel even if it already exists")
+    args = ap.parse_args(argv)
+    return args.cycle, args.force
 
 
 if __name__ == "__main__":
-    main(parse_args())
+    _cycle, _force = parse_args()
+    main(_cycle, force=_force)

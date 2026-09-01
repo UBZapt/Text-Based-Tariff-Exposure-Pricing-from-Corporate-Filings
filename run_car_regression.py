@@ -27,6 +27,7 @@ clustered on permno.
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -55,11 +56,14 @@ PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
 # (permno, reference_date); each event reads the slice at the reference date whose 10-K selection
 # window closed before it. That is what makes the cross-cycle events use their own filings.
 TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
-TEXP_PANEL_DIAG = OUTPUT_DIR / "texp_panel_diagnostics.csv"   # per (permno, reference_date) drops
+INTERMEDIATE_DIR = BASE / "intermediate"
+TEXP_PANEL_DIAG = INTERMEDIATE_DIR / "texp_panel_diagnostics.csv"  # per (permno, ref_date) drops
 FS_CSV = CLEAN_DIR / "foreign_sales_share.csv"
 EDGAR_LOG = BASE / "edgar_pull_log.csv"                 # supplies the pull-failure reasons
 RESULTS_OUT = OUTPUT_DIR / "car_regression_results.csv"
 STABILITY_OUT = OUTPUT_DIR / "stability_test_results.csv"
+SIGNFLIP_OUT = OUTPUT_DIR / "signflip_test_results.csv"
+INDUSTRY_SPLIT_OUT = OUTPUT_DIR / "industry_split_results.csv"
 REPORT_OUT = OUTPUT_DIR / "car_regression_validation_report.txt"
 
 # Specification. Every choice below is named here rather than inline in a function body.
@@ -69,7 +73,14 @@ CONTROLS = ["ln_me_lag", "bm", "lev", "mom12"]
 INDUSTRY_COLUMN = "ff12"
 FF12_REFERENCE = "Other"         # omitted dummy; shifts the intercept, never b
 APPLY_SCREEN = True              # in_screened_universe_pit is the section 6 sample definition
-COV_TYPE = "nonrobust"           # this pass only; section 7.2 nominates White HC
+# Section 7.2 nominates White heteroskedasticity-robust errors, in both v5 and v6. HC1 is that,
+# with the n/(n-k) correction these sample sizes (917-1,568) warrant. Note v5 section 8 - which v6
+# does not revise - instead nominates double-clustering by firm and industry; section 7.2 governs
+# because it is the revised, specific instruction for this regression, and because clustering is
+# inapt on a single cross-section: each firm appears once, so firm-clustering reduces to HC, and
+# 12 FF12 groups already absorbed as fixed effects give far too few clusters. Recorded in the
+# deviations section of the report rather than resolved silently.
+COV_TYPE = "HC1"
 
 # The panel columns this script reads. The event-date row is already point-in-time: ln_me_lag is
 # market equity lagged one trading day, bm and lev are built on that same lagged ME, and mom12
@@ -91,13 +102,47 @@ TRIM_SPEC = "trim_" + "_".join(TRIM_COLUMNS)
 EXPECTED_SIGN = ccd.CYCLES[ccd.DEFAULT_CYCLE]["expected_sign"]
 SIGN_WORD = {-1: "NEGATIVE", 1: "POSITIVE", 0: "ZERO"}
 
-# The pooled H4 stability test (section 7.6) is the one place clustered standard errors are used:
-# stacking two cycles repeats each firm, so COV_TYPE's independence assumption fails there. The
-# per-event regressions keep COV_TYPE, which is what makes them identical to the section 7.2 run.
+# The two pooled tests (H1 sign flip, H4 stability) are the only place clustered standard errors
+# are used: stacking two groups repeats each firm, so COV_TYPE's independence assumption fails
+# there. The per-event regressions keep COV_TYPE, which is what makes them identical across cycles.
 STABILITY_COV_TYPE = "cluster"
-CYCLE_COLUMN = "cc"                             # 1 on the out-of-sample cycle's rows, 0 on 2025
-INTERACTION_COLUMN = f"{TEXP_COLUMN}_x_{CYCLE_COLUMN}"
+GROUP_COLUMN = "_group"          # which side of a pooled test a row belongs to
+GROUP_SEP = "__"                 # pooled design term names read as <regressor>__<group tag>
+EVENT_DATE_COLUMN = "event_date"                # the second clustering dimension
 BASELINE_CYCLE = "2025"                         # the in-sample cycle b^2025 is measured on
+
+# Cluster asymptotics need many clusters. The permno dimension always has thousands; the event-date
+# dimension has at most nine anywhere in this project, and as few as two (every pairwise test, and
+# the H1 sign flip, which has one event per leg).
+#
+# 30 is the conventional floor for cluster-robust inference, and on this data it is never met, so
+# the event dimension is never the primary. That is a finding rather than a technicality: the
+# two-way standard error is computed and reported anyway, in `se_twoway`, and where the stack spans
+# eight event dates it comes back at roughly a QUARTER of the permno-only error. Two-way clustering
+# should if anything widen an interval, so a four-fold narrowing is the Cameron-Gelbach-Miller
+# estimator failing on too few clusters, not a gain in precision. Reporting it as primary would
+# have turned an insignificant cross-cycle difference into p < 0.001 on an error known to be wrong.
+#
+# The consequence is stated rather than papered over: cross-sectional dependence within an event
+# date remains UNCORRECTED in the pooled tests, and this panel cannot correct it. See the
+# deviations section.
+MIN_EVENT_CLUSTERS = 30
+
+# H1 predicts opposite signs on the two legs, so delta = b_loosening - b_tightening > 0. The
+# two-sided p tests equality; the one-sided p tests the directional prediction the design makes.
+SIGNFLIP_DELTA_SIGN = +1
+
+# Floor for a within-FF12-group fit (v6 section 5.2 item 1). Without the industry dummies the
+# specification carries 7 parameters (TExp, FS, four controls, constant), so 30 firms leaves 23
+# residual degrees of freedom. Set from the parameter count, not from which groups it excludes,
+# and groups below it are reported as skipped rather than dropped silently or pooled to rescue.
+MIN_INDUSTRY_N = 30
+
+# A pooled leg's coefficient must reproduce its own per-event estimate. The blocks are
+# orthogonal by construction, so the only difference is floating-point accumulation order;
+# measured worst case across both cycles is ~2e-15, so this is three orders of magnitude of
+# headroom and still tight enough to catch a design that is not actually block diagonal.
+POOLED_COEF_TOL = 1e-9
 
 STARS = {0.01: "***", 0.05: "**", 0.10: "*"}
 MAX_LISTED = 10                  # identities printed before deferring to a count
@@ -109,12 +154,13 @@ _REPORT: list[str] = []
 
 def select_cycle(name: str) -> dict:
     """Rebind this module's cycle-dependent paths and signs, and Scripts 1 and 2's alongside."""
-    global PANEL_PATH, EXPECTED_SIGN, RESULTS_OUT, STABILITY_OUT, REPORT_OUT
+    global PANEL_PATH, EXPECTED_SIGN, RESULTS_OUT, STABILITY_OUT, SIGNFLIP_OUT, REPORT_OUT
     cycle = ec.select_cycle(name)
     PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
     EXPECTED_SIGN = cycle["expected_sign"]
     RESULTS_OUT = OUTPUT_DIR / f"car_regression_results{cycle['suffix']}.csv"
     STABILITY_OUT = OUTPUT_DIR / f"stability_test_results{cycle['suffix']}.csv"
+    SIGNFLIP_OUT = OUTPUT_DIR / f"signflip_test_results{cycle['suffix']}.csv"
     REPORT_OUT = OUTPUT_DIR / f"car_regression_validation_report{cycle['suffix']}.txt"
     return cycle
 
@@ -254,8 +300,30 @@ def load_fs(path: Path = FS_CSV) -> pd.DataFrame:
     return frame
 
 
-def load_texp_reasons(reference_date: str, diag: Path = TEXP_PANEL_DIAG,
-                      log: Path = EDGAR_LOG) -> dict[int, str]:
+@lru_cache(maxsize=None)
+def _reason_sources(diag: Path, log: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read the two reason sources ONCE per process and keep them grouped by reference date.
+
+    ``load_texp_reasons`` is called once per distinct reference date - nine times on a cross-cycle
+    run, nine more from build_fm_panel per vintage year - and each call used to re-read the whole
+    5.5 MB pull log and the panel diagnostics from disk, then throw them away. That is eighteen
+    full reads of the same two files per run for data keyed on a column both already carry, and it
+    is the round-trip CLAUDE.md's cleaned-data convention rules out.
+
+    Cached on the two paths, so a caller that legitimately points at different files still gets
+    its own read. The frames are returned unsliced; the slicing stays in the caller.
+    """
+    for path in (diag, log):
+        if not path.exists():
+            raise FileNotFoundError(f"{path.name} not found; it records why a firm has no score.")
+    dropped = pd.read_csv(diag, usecols=["permno", "reference_date", "drop_reason"])
+    pull = pd.read_csv(log, usecols=["permno", "reference_date", "found_10k", "fail_reason"],
+                       dtype=str)
+    return dropped, pull
+
+
+def load_texp_reasons(reference_date: str, diag: Path | None = None,
+                      log: Path | None = None) -> dict[int, str]:
     """Why a firm carries no TExp at one reference date, from the module that made each decision.
 
     Both sources are sliced to the reference date, because both are now multi-vintage: a firm can
@@ -264,21 +332,18 @@ def load_texp_reasons(reference_date: str, diag: Path = TEXP_PANEL_DIAG,
     diagnostics; firms whose pull found no 10-K in the window come from the log's fail_reason.
     Nothing is inferred - a permno absent from both is reported as such by the caller.
     """
-    for path in (diag, log):
-        if not path.exists():
-            raise FileNotFoundError(f"{path.name} not found; it records why a firm has no score.")
+    diag = TEXP_PANEL_DIAG if diag is None else diag
+    log = EDGAR_LOG if log is None else log
+    all_dropped, all_pull = _reason_sources(diag, log)
 
-    dropped = pd.read_csv(diag, usecols=["permno", "reference_date", "drop_reason"])
-    dropped = dropped[dropped["reference_date"] == reference_date]
+    dropped = all_dropped[all_dropped["reference_date"] == reference_date]
     if dropped["permno"].duplicated().any():
         raise ValueError(f"{diag.name} is not unique on permno at {reference_date}")
     reasons = {int(pn): str(why) for pn, why in
                dropped.loc[dropped["drop_reason"].notna(),
                            ["permno", "drop_reason"]].itertuples(index=False)}
 
-    pull = pd.read_csv(log, usecols=["permno", "reference_date", "found_10k", "fail_reason"],
-                       dtype=str)
-    pull = pull[pull["reference_date"] == reference_date].copy()
+    pull = all_pull[all_pull["reference_date"] == reference_date].copy()
     if pull.empty:
         raise ValueError(f"{log.name} holds no pull rows at reference date {reference_date}")
     pull["permno"] = pull["permno"].astype(int)
@@ -389,26 +454,35 @@ def regression_frame(merged: pd.DataFrame, reason: pd.Series,
 # Estimation                                                                  #
 # --------------------------------------------------------------------------- #
 def design_matrix(frame: pd.DataFrame, include_texp: bool = True,
-                  extra: tuple[str, ...] = ()) -> tuple[pd.Series, pd.DataFrame]:
+                  extra: tuple[str, ...] = (),
+                  include_industry: bool = True) -> tuple[pd.Series, pd.DataFrame]:
     """Regressors with FF12 dummies, the reference category dropped by name rather than position.
 
-    ``extra`` carries the pooled stability test's cycle dummy and interaction. It is empty for
-    every section 7.2 and 7.6 per-event fit, so those design matrices are unchanged.
+    ``extra`` carries any additional pre-built columns. It is empty for every section 7.2 and 7.6
+    per-event fit, so those design matrices are unchanged.
+
+    ``include_industry=False`` omits the dummies entirely, for a sample that is by construction a
+    single industry - a within-FF12-group fit (v6 section 5.2 item 1). Without it such a fit cannot
+    be estimated at all: the reference category is absent from every group except its own, so the
+    raise below fires on eleven of the twelve.
     """
-    dummies = pd.get_dummies(frame[INDUSTRY_COLUMN], prefix=INDUSTRY_COLUMN, dtype=float)
-    ref = f"{INDUSTRY_COLUMN}_{FF12_REFERENCE}"
-    if ref not in dummies.columns:
-        raise ValueError(f"reference industry {FF12_REFERENCE!r} is absent from this sample; "
-                         f"present: {sorted(frame[INDUSTRY_COLUMN].unique())}")
     regressors = ([TEXP_COLUMN] if include_texp else []) + list(extra) + [FS_COLUMN] + CONTROLS
-    design = pd.concat([frame[regressors].astype(float), dummies.drop(columns=ref)], axis=1)
+    blocks = [frame[regressors].astype(float)]
+    if include_industry:
+        dummies = pd.get_dummies(frame[INDUSTRY_COLUMN], prefix=INDUSTRY_COLUMN, dtype=float)
+        ref = f"{INDUSTRY_COLUMN}_{FF12_REFERENCE}"
+        if ref not in dummies.columns:
+            raise ValueError(f"reference industry {FF12_REFERENCE!r} is absent from this sample; "
+                             f"present: {sorted(frame[INDUSTRY_COLUMN].unique())}")
+        blocks.append(dummies.drop(columns=ref))
+    design = pd.concat(blocks, axis=1)
     design["_cons"] = 1.0
     return frame["car"].astype(float), design
 
 
-def fit_ols(frame: pd.DataFrame, include_texp: bool = True):
+def fit_ols(frame: pd.DataFrame, include_texp: bool = True, include_industry: bool = True):
     """OLS with the configured covariance estimator; missing='raise' asserts listwise deletion."""
-    y, design = design_matrix(frame, include_texp)
+    y, design = design_matrix(frame, include_texp, include_industry=include_industry)
     return sm.OLS(y, design, missing="raise").fit(cov_type=COV_TYPE)
 
 
@@ -467,8 +541,84 @@ def result_rows(run: str, event: str, window: str, spec: str, res) -> list[dict]
 
 
 # --------------------------------------------------------------------------- #
-# H4 stability test (section 7.6)                                             #
+# Pooled two-group tests: H1 sign flip (section 7.2) and H4 stability (7.6)    #
 # --------------------------------------------------------------------------- #
+# Both tests ask the same question of different pairs - are these two b's equal? - so they share
+# one design, one estimator and one row builder. H1 pairs the two legs of a single cycle; H4 pairs
+# the same leg across two cycles.
+#
+# The design is BLOCK DIAGONAL: every regressor, the constant and the FF12 dummies included, is
+# multiplied by each group's indicator, and no un-interacted term survives. Three consequences,
+# all of them the point:
+#
+#   1. Each group's b is EXACTLY its own per-event estimate. The blocks are orthogonal by
+#      construction (a row is non-zero in one block only), so OLS on the stack reproduces the two
+#      separate regressions coefficient for coefficient. A pooled specification that instead
+#      constrains the controls equal across groups does not: it re-estimates b under a restriction
+#      that borrows control coefficients from the other group, and b then moves away from the
+#      number section 7.2 reports under the same label. That is what this replaces.
+#   2. delta is a linear combination of two fitted coefficients, so its standard error comes from
+#      a t_test on the joint covariance - which is the only reason the stack is needed at all.
+#   3. The residuals equal the two separate fits' residuals, so nothing about the point estimates
+#      is a compromise; only the covariance is joint.
+def pooled_term(column: str, tag: str) -> str:
+    """Name of ``column``'s slope inside group ``tag`` of a pooled two-group design."""
+    return f"{column}{GROUP_SEP}{tag}"
+
+
+def pooled_frame(frames_by_tag: dict[str, list[pd.DataFrame]]) -> pd.DataFrame:
+    """Stack two groups' estimation samples, tagged, preserving every per-event exclusion.
+
+    The inputs are the primary per-event estimation samples themselves, so every exclusion the
+    section 7.2 funnel applied is already applied here - a pooled test cannot quietly admit a firm
+    the per-event regressions dropped.
+    """
+    parts = [f.assign(**{GROUP_COLUMN: tag}) for tag, frames in frames_by_tag.items()
+             for f in frames]
+    return pd.concat(parts, ignore_index=True)
+
+
+def pooled_design(stacked: pd.DataFrame, tags: tuple[str, str]) -> tuple[pd.Series, pd.DataFrame]:
+    """Block-diagonal design: every regressor interacted with each group indicator.
+
+    An FF12 dummy present in only one group yields an all-zero column in the other; those are
+    dropped, and the surviving column count is asserted against the design's rank so a silently
+    singular design cannot reach the estimator.
+    """
+    y, base = design_matrix(stacked)
+    blocks = {}
+    for tag in tags:
+        keep = (stacked[GROUP_COLUMN] == tag).to_numpy(dtype=float)
+        for column in base.columns:
+            values = base[column].to_numpy(dtype=float) * keep
+            if np.any(values != 0.0):
+                blocks[pooled_term(column, tag)] = values
+    design = pd.DataFrame(blocks, index=base.index)
+    rank = np.linalg.matrix_rank(design.to_numpy())
+    if rank < design.shape[1]:
+        raise ValueError(f"pooled design is singular: {design.shape[1]} columns, rank {rank}")
+    return y, design
+
+
+def fit_pooled(stacked: pd.DataFrame, tags: tuple[str, str], two_way: bool):
+    """Pooled OLS on the block-diagonal design, clustered on permno and optionally event date.
+
+    Clustering on permno is required rather than chosen: stacking two groups puts each firm in the
+    sample once per event, so residuals are correlated within firm and COV_TYPE's independence
+    assumption fails. The event-date dimension is added where the stack spans enough event dates
+    to support it - every firm in one cross-section shares that day's common shock, which
+    clustering on permno alone leaves uncorrected. This is the only place section 7.2's error
+    methodology is departed from, and the departure is reported in the deviations section.
+    """
+    y, design = pooled_design(stacked, tags)
+    model = sm.OLS(y, design, missing="raise")
+    groups = stacked["permno"].to_numpy()
+    if two_way:
+        events = pd.factorize(stacked[EVENT_DATE_COLUMN])[0]
+        groups = np.column_stack([groups, events])
+    return model.fit(cov_type=STABILITY_COV_TYPE, cov_kwds={"groups": groups})
+
+
 def stability_specs(active: str, baseline: str) -> list[dict]:
     """Which runs pool against which, per leg, for H0: b^baseline = b^active.
 
@@ -493,66 +643,89 @@ def stability_specs(active: str, baseline: str) -> list[dict]:
     ]
 
 
-def stability_frame(baseline_frames: list[pd.DataFrame],
-                    cycle_frames: list[pd.DataFrame]) -> pd.DataFrame:
-    """Stack two cycles' regression samples with a cycle dummy and a TExp interaction.
+def pooled_rows(shared: dict, stacked: pd.DataFrame, tags: tuple[str, str],
+                res, res_permno, res_twoway, delta_sign: int | None) -> list[dict]:
+    """One row per reported quantity: each group's b, their difference, and the H0 statistic.
 
-    The inputs are the primary per-event estimation samples themselves, so every exclusion the
-    section 7.2 funnel applied is already applied here - the pooled test cannot quietly admit a
-    firm the per-event regressions dropped.
+    ``delta_sign``, when given, adds the one-sided p-value for a signed directional prediction;
+    the two-sided p on the same row always tests plain equality.
+
+    ``coef_per_sd`` rescales each b by the standard deviation of raw TExp in its OWN group. The
+    measure's cross-sectional sd rises about 2.5x across the vintages these tests pool, so the raw
+    coefficients are not in comparable units and a raw equality test is not scale-invariant. The
+    per-sd column makes the comparison legible without re-estimating anything.
     """
-    parts = ([f.assign(**{CYCLE_COLUMN: 0.0}) for f in baseline_frames]
-             + [f.assign(**{CYCLE_COLUMN: 1.0}) for f in cycle_frames])
-    stacked = pd.concat(parts, ignore_index=True)
-    stacked[INTERACTION_COLUMN] = stacked[TEXP_COLUMN] * stacked[CYCLE_COLUMN]
-    return stacked
-
-
-def fit_stability(stacked: pd.DataFrame):
-    """Pooled OLS with the cycle interaction, standard errors clustered on permno.
-
-    Clustering is required rather than chosen: stacking two cycles puts each firm in the sample
-    once per event, so the residuals are correlated within firm and COV_TYPE's independence
-    assumption fails. This is the only place the section 7.2 error methodology is departed from,
-    and the departure is reported in the deviations section.
-    """
-    y, design = design_matrix(stacked, extra=(CYCLE_COLUMN, INTERACTION_COLUMN))
-    return sm.OLS(y, design, missing="raise").fit(
-        cov_type=STABILITY_COV_TYPE, cov_kwds={"groups": stacked["permno"].to_numpy()})
-
-
-def stability_rows(test: str, leg: str, window: str, baseline_run: str, cycle_runs: list[str],
-                   stacked: pd.DataFrame, res) -> list[dict]:
-    """One row per reported quantity: b on each cycle, the interaction, and the H0 statistic.
-
-    b^active is the linear combination b + delta, so its standard error is taken from a t_test on
-    the fitted covariance rather than by adding the two separately - the terms are correlated.
-    """
-    combo = res.t_test(f"{TEXP_COLUMN} + {INTERACTION_COLUMN} = 0")
-    wald = res.f_test(f"{INTERACTION_COLUMN} = 0")
-    is_cycle = stacked[CYCLE_COLUMN].eq(1.0)
+    left, right = tags
+    b_left, b_right = pooled_term(TEXP_COLUMN, left), pooled_term(TEXP_COLUMN, right)
+    delta = res.t_test(f"{b_right} - {b_left} = 0")
+    wald = res.f_test(f"{b_right} - {b_left} = 0")
+    is_right = stacked[GROUP_COLUMN].eq(right)
+    sd = {tag: float(stacked.loc[stacked[GROUP_COLUMN].eq(tag), TEXP_COLUMN].std(ddof=1))
+          for tag in tags}
+    n_events = int(stacked[EVENT_DATE_COLUMN].nunique())
+    twoway_ok = n_events >= MIN_EVENT_CLUSTERS
     shared = {
-        "test": test, "leg": leg, "window": window, "baseline_run": baseline_run,
-        "cycle_runs": "+".join(cycle_runs),
-        "n": int(res.nobs), "n_baseline": int((~is_cycle).sum()), "n_cycle": int(is_cycle.sum()),
-        "n_clusters": int(stacked["permno"].nunique()),
+        **shared, "group_left": left, "group_right": right,
+        "n": int(res.nobs), "n_left": int((~is_right).sum()), "n_right": int(is_right.sum()),
+        "n_permno_clusters": int(stacked["permno"].nunique()), "n_event_clusters": n_events,
+        "cov_type": "cluster(permno, event_date)" if twoway_ok else "cluster(permno)",
+        "twoway_reliable": twoway_ok,
+        "sd_texp_left": sd[left], "sd_texp_right": sd[right],
         "r2": float(res.rsquared), "adj_r2": float(res.rsquared_adj),
         "f_stat": float(np.asarray(wald.fvalue).squeeze()),
         "f_pvalue": float(np.asarray(wald.pvalue).squeeze()),
     }
 
-    def row(term, coef, se, tstat, pvalue, label):
+    def row(term, label, coef, se, tstat, pvalue, se_permno, se_twoway, per_sd):
+        pvalue = float(pvalue)
+        one_sided = ""
+        if delta_sign is not None and label.startswith("delta"):
+            # A signed prediction halves the two-sided p when the estimate carries the predicted
+            # sign, and takes 1 - p/2 when it does not.
+            one_sided = (pvalue / 2 if np.sign(coef) == delta_sign else 1 - pvalue / 2)
         return {**shared, "term": term, "label": label, "coef": float(coef), "se": float(se),
-                "t": float(tstat), "p": float(pvalue), "stars": stars(float(pvalue))}
+                "t": float(tstat), "p": pvalue, "stars": stars(pvalue),
+                "p_one_sided": one_sided, "se_permno": float(se_permno),
+                "se_twoway": None if se_twoway is None else float(se_twoway),
+                "coef_per_sd": None if per_sd is None else float(coef) * per_sd}
 
-    rows = [row(term, res.params[term], res.bse[term], res.tvalues[term], res.pvalues[term], label)
-            for term, label in ((TEXP_COLUMN, f"b^{BASELINE_CYCLE}"),
-                                (CYCLE_COLUMN, "cycle intercept shift"),
-                                (INTERACTION_COLUMN, "delta = b^cycle - b^baseline"))]
-    rows.append(row(f"{TEXP_COLUMN}+{INTERACTION_COLUMN}",
-                    np.squeeze(combo.effect), np.squeeze(combo.sd),
-                    np.squeeze(combo.tvalue), np.squeeze(combo.pvalue), "b^cycle"))
+    def se_of(fit, term):
+        return None if fit is None else fit.bse[term]
+
+    rows = [row(term, label, res.params[term], res.bse[term], res.tvalues[term],
+                res.pvalues[term], res_permno.bse[term], se_of(res_twoway, term), sd[tag])
+            for term, label, tag in ((b_left, f"b^{left}", left), (b_right, f"b^{right}", right))]
+    contrast = f"{b_right} - {b_left} = 0"
+    delta_permno = res_permno.t_test(contrast)
+    delta_twoway = None if res_twoway is None else np.squeeze(res_twoway.t_test(contrast).sd)
+    rows.append(row(f"{b_right}-{b_left}", f"delta = b^{right} - b^{left}",
+                    np.squeeze(delta.effect), np.squeeze(delta.sd), np.squeeze(delta.tvalue),
+                    np.squeeze(delta.pvalue), np.squeeze(delta_permno.sd), delta_twoway, None))
     return rows
+
+
+def run_pooled(shared: dict, frames_by_tag: dict[str, list[pd.DataFrame]],
+               delta_sign: int | None = None) -> tuple[list[dict], dict]:
+    """Fit one pooled two-group comparison and return its rows plus the pieces the report needs.
+
+    Every covariance the test can support is fitted, not just the primary one: the permno-only
+    error lands in `se_permno` and the two-way error, where two or more event dates exist, in
+    `se_twoway`. Both are reported on every row whatever the primary is, which is what makes the
+    two comparable - and it is how the two-way estimator's collapse on few event clusters was
+    caught rather than shipped.
+    """
+    tags = tuple(frames_by_tag)
+    if len(tags) != 2:
+        raise ValueError(f"a pooled test needs exactly two groups; got {tags}")
+    stacked = pooled_frame(frames_by_tag)
+    n_events = stacked[EVENT_DATE_COLUMN].nunique()
+    two_way = n_events >= MIN_EVENT_CLUSTERS
+    res_permno = fit_pooled(stacked, tags, two_way=False)
+    res_twoway = fit_pooled(stacked, tags, two_way=True) if n_events > 1 else None
+    res = res_twoway if two_way else res_permno
+    rows = pooled_rows(shared, stacked, tags, res, res_permno, res_twoway, delta_sign)
+    return rows, {**shared, "tags": tags, "stacked": stacked, "res": res, "two_way": two_way,
+                  "res_permno": res_permno, "res_twoway": res_twoway}
 
 
 def stability_tests(active_fits: list, baseline_fits: list, active: str,
@@ -580,15 +753,129 @@ def stability_tests(active_fits: list, baseline_fits: list, active: str,
             if test == "pairwise" and runs == spec["pool"]:
                 continue        # the pooled fit already is this regression
             for window in ec.CAR_COLUMNS:
-                stacked = stability_frame(
-                    [baseline_frames[b_run][window]["frame"]],
-                    [active_frames[run][window]["frame"] for run in runs])
-                res = fit_stability(stacked)
-                rows += stability_rows(test, leg, window, b_run, runs, stacked, res)
-                summaries.append({"test": test, "leg": leg, "window": window,
-                                  "baseline_run": b_run, "cycle_runs": runs,
-                                  "stacked": stacked, "res": res})
+                shared = {"test": test, "leg": leg, "window": window, "baseline_run": b_run,
+                          "cycle_runs": "+".join(runs)}
+                new_rows, summary = run_pooled(shared, {
+                    baseline: [baseline_frames[b_run][window]["frame"]],
+                    active: [active_frames[run][window]["frame"] for run in runs]})
+
+                # b^baseline must equal the section 7.2 coefficient it is labelled with. Under the
+                # superseded common-controls specification it did not, by up to a factor of two,
+                # which is what made the old H4 table misread. Asserted so it cannot recur.
+                pooled = float(summary["res"].params[pooled_term(TEXP_COLUMN, baseline)])
+                standalone = float(
+                    baseline_frames[b_run][window]["specs"]["primary"].params[TEXP_COLUMN])
+                if abs(pooled - standalone) > POOLED_COEF_TOL:
+                    raise ValueError(
+                        f"pooled b^{baseline} at {window} is {pooled:.10f} but the per-event "
+                        f"regression gives {standalone:.10f}; design is not block diagonal")
+                rows += new_rows
+                summaries.append({**summary, "cycle_run_list": runs})
     return rows, summaries
+
+
+def signflip_tests(fits: list, cycle: str) -> tuple[list[dict], list[dict]]:
+    """The formal H1 test: is the tightening leg's b different from the loosening leg's?
+
+    Section 7.2 calls the sign flip the core contribution, and both design documents state H1 as a
+    pair of one-sided predictions on two separately estimated coefficients - neither nominates a
+    test of the DIFFERENCE. Reporting the two signs alone cannot distinguish a genuine flip from
+    two coefficients that are individually indistinguishable from zero and from each other, which
+    is exactly the situation at car_m5p5. This supplies that test.
+
+    The exposure characteristic is identical across the two legs by construction (both read the
+    same pre-event 10-K vintage), so all the identifying variation sits in the dependent variable -
+    which is what makes delta interpretable as the response of pricing to the policy reversal
+    rather than to a change in the measure.
+    """
+    per_run = {run: per_window for run, _, per_window in fits}
+    tight, loose = ccd.CYCLES[cycle]["sign_flip_pair"]
+    missing = [r for r in (tight, loose) if r not in per_run]
+    if missing:
+        raise ValueError(f"cycle {cycle!r} sign-flip run(s) {missing} absent from this run's fits")
+
+    rows, summaries = [], []
+    for window in ec.CAR_COLUMNS:
+        shared = {"test": "signflip", "cycle": cycle, "window": window,
+                  "tightening_run": tight, "loosening_run": loose}
+        new_rows, summary = run_pooled(
+            shared,
+            {tight: [per_run[tight][window]["frame"]], loose: [per_run[loose][window]["frame"]]},
+            delta_sign=SIGNFLIP_DELTA_SIGN)
+
+        # The block-diagonal design's whole justification is that each leg's b is untouched by
+        # pooling. Assert it rather than assume it: a mismatch would mean the blocks are not
+        # orthogonal, which no p-value would have revealed.
+        for tag in (tight, loose):
+            pooled = float(summary["res"].params[pooled_term(TEXP_COLUMN, tag)])
+            standalone = float(per_run[tag][window]["specs"]["primary"].params[TEXP_COLUMN])
+            if abs(pooled - standalone) > POOLED_COEF_TOL:
+                raise ValueError(
+                    f"pooled b for {tag} at {window} is {pooled:.10f} but its own per-event "
+                    f"regression gives {standalone:.10f}; the pooled design is not block diagonal")
+        rows += new_rows
+        summaries.append(summary)
+    return rows, summaries
+
+
+def write_signflip(rows: list[dict], path: Path | None = None) -> Path:
+    """Every H1 sign-flip quantity, long format."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    path = SIGNFLIP_OUT if path is None else path
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Within-industry estimation (v6 section 5.2 item 1)                          #
+# --------------------------------------------------------------------------- #
+def industry_split(fits: list) -> list[dict]:
+    """b estimated separately within each FF12 group, per run and window.
+
+    v6 section 5.2 item 1 calls this the most important robustness check in the paper: industry
+    fixed effects establish that b survives within-industry variation on average, but they cannot
+    say whether the effect is diffuse across sectors or concentrated in two or three. A
+    concentrated effect is still a result - it is a different result, and must not be written up
+    as a general one.
+
+    The industry dummies are dropped from these fits because each sample is one industry by
+    construction. Groups below MIN_INDUSTRY_N are reported as skipped rather than estimated: the
+    specification carries 7 parameters once the dummies go, and a handful of firms cannot support
+    it. Nothing is pooled to rescue a thin group.
+    """
+    rows: list[dict] = []
+    for run, event, per_window in fits:
+        for window in ec.CAR_COLUMNS:
+            frame = per_window[window]["frame"]
+            for industry, block in frame.groupby(INDUSTRY_COLUMN, sort=True):
+                shared = {"run": run, "event": event, "window": window, "ff12": industry,
+                          "n": len(block), "expected_sign": EXPECTED_SIGN[event]}
+                if len(block) < MIN_INDUSTRY_N:
+                    rows.append({**shared, "skipped": f"n < {MIN_INDUSTRY_N}", "coef": None,
+                                 "se": None, "t": None, "p": None, "stars": "",
+                                 "sign_match": "", "r2": None, "sd_texp": None,
+                                 "coef_per_sd": None})
+                    continue
+                res = fit_ols(block, include_industry=False)
+                coef = float(res.params[TEXP_COLUMN])
+                pvalue = float(res.pvalues[TEXP_COLUMN])
+                sd = float(block[TEXP_COLUMN].std(ddof=1))
+                rows.append({**shared, "skipped": "", "coef": coef,
+                             "se": float(res.bse[TEXP_COLUMN]),
+                             "t": float(res.tvalues[TEXP_COLUMN]), "p": pvalue,
+                             "stars": stars(pvalue),
+                             "sign_match": int(np.sign(coef)) == EXPECTED_SIGN[event],
+                             "r2": float(res.rsquared), "sd_texp": sd, "coef_per_sd": coef * sd})
+    return rows
+
+
+def write_industry_split(rows: list[dict], path: Path | None = None) -> Path:
+    """Within-FF12-group coefficients, long format. Its own file, so the headline results
+    table keeps one row per (run, window, spec, term) and its schema does not shift."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    path = INDUSTRY_SPLIT_OUT if path is None else path
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
 
 
 def write_stability(rows: list[dict], path: Path | None = None) -> Path:
@@ -689,18 +976,92 @@ def _report_spot_check(active: dict) -> None:
     _say("  excludes that firm from the regression under listwise deletion.")
 
 
+def _pooled_quantities(summary: dict) -> dict:
+    """b on each side, their difference, and the difference's statistics, from one pooled fit."""
+    res, (left, right) = summary["res"], summary["tags"]
+    b_left, b_right = pooled_term(TEXP_COLUMN, left), pooled_term(TEXP_COLUMN, right)
+    delta = res.t_test(f"{b_right} - {b_left} = 0")
+    return {"b_left": float(res.params[b_left]), "b_right": float(res.params[b_right]),
+            "delta": float(np.squeeze(delta.effect)), "se": float(np.squeeze(delta.sd)),
+            "t": float(np.squeeze(delta.tvalue)), "p": float(np.squeeze(delta.pvalue)),
+            "n": int(res.nobs), "cov": ("cluster(permno, event_date)" if summary["two_way"]
+                                        else "cluster(permno)")}
+
+
+def _report_signflip(summaries: list[dict], active: dict) -> None:
+    """The formal H1 test: a p-value on the difference between the two legs."""
+    tight, loose = ccd.CYCLES[active["cycle"]]["sign_flip_pair"]
+    _section("6b. H1 sign flip - formal test of the difference between legs")
+    _say("  Section 6 above compares the two legs' SIGNS. That cannot distinguish a genuine flip")
+    _say("  from two coefficients individually indistinguishable from zero and from each other.")
+    _say("  This is the test of the difference itself:")
+    _say()
+    _say(f"    CAR = sum over legs of [ b_leg*{TEXP_COLUMN} + c_leg*{FS_COLUMN} + gamma_leg'X")
+    _say("                             + FF12 dummies_leg ],   H0: delta = 0")
+    _say(f"    delta = b^{loose} - b^{tight}")
+    _say()
+    _say("  The design is block diagonal - every regressor, the constant and the industry dummies")
+    _say("  included, enters once per leg and nothing is constrained equal across them. So each")
+    _say("  leg's b is EXACTLY its own section 7.2 estimate (asserted below), and the stack exists")
+    _say("  only to supply the joint covariance delta's standard error needs.")
+    _say("  Errors are clustered on permno: a firm appears in both legs, so the per-event")
+    _say("  independence assumption does not carry over. The event-date dimension is not added -")
+    _say(f"  two legs is two event dates, below MIN_EVENT_CLUSTERS = {MIN_EVENT_CLUSTERS}.")
+    _say()
+    _say("  Exposure is identical across the legs by construction (both read the same pre-event")
+    _say("  10-K vintage), so every bit of the identifying variation sits in the dependent")
+    _say("  variable. H1 predicts delta > 0; the one-sided p tests that, the two-sided p tests")
+    _say("  plain equality.")
+    _say()
+    _say(f"    {'window':<10}{'b^tightening':>14}{'b^loosening':>14}{'delta':>11}"
+         f"{'se':>10}{'t':>8}{'p (2-sided)':>14}{'p (1-sided)':>13}{'n':>8}")
+    for s in summaries:
+        q = _pooled_quantities(s)
+        p = q["p"]
+        one = p / 2 if np.sign(q["delta"]) == SIGNFLIP_DELTA_SIGN else 1 - p / 2
+        cell = f"{p:.4f}{stars(p)}"
+        _say(f"    {_short(s['window']):<10}{q['b_left']:>14.5f}{q['b_right']:>14.5f}"
+             f"{q['delta']:>11.5f}{q['se']:>10.5f}{q['t']:>8.3f}"
+             f"{cell:>14}{one:>13.4f}{q['n']:>8,}")
+    _say()
+    _say("  Reading. A correctly signed delta means the loosening leg's coefficient sits above the")
+    _say("  tightening leg's by more than sampling error explains; that, not the two signs, is")
+    _say("  what falsifies the generic-fragility alternative. An insignificant delta with both")
+    _say("  legs correctly signed is weak evidence for H1, not evidence against it - but it must")
+    _say("  be reported as weak rather than as a flip that HOLDS.")
+
+
 def _report_stability(summaries: list[dict], active: dict) -> None:
     """The H4 stability test: is b the same in both cycles?"""
     _section("10b. H4 cross-cycle stability - H0: b^2025 = b^2018-19")
-    _say(f"  CAR = a + b*{TEXP_COLUMN} + B*{CYCLE_COLUMN} + d*({TEXP_COLUMN} x {CYCLE_COLUMN})")
-    _say(f"        + c*{FS_COLUMN} + gamma'X + FF12 dummies + e,   H0: d = 0")
-    _say(f"  {CYCLE_COLUMN} = 1 on the {active['cycle']} rows, 0 on the {BASELINE_CYCLE} rows. "
-         f"Estimated on the")
-    _say("  per-event primary samples themselves, so every section 7.2 exclusion already applies.")
-    _say(f"  Standard errors clustered on permno ({STABILITY_COV_TYPE}); firms repeat across the")
-    _say("  stacked events, which is what rules the per-event error assumption out here.")
+    _say(f"  CAR = sum over cycles of [ b_cyc*{TEXP_COLUMN} + c_cyc*{FS_COLUMN} + gamma_cyc'X")
+    _say("                             + FF12 dummies_cyc ],   H0: delta = 0")
+    _say(f"  delta = b^{active['cycle']} - b^{BASELINE_CYCLE}. Estimated on the per-event primary")
+    _say("  samples themselves, so every section 7.2 exclusion already applies.")
+    _say()
+    _say("  The design is block diagonal: nothing is constrained equal across the cycles, so each")
+    _say(f"  cycle's b is EXACTLY its own per-event estimate. This replaces a specification that")
+    _say(f"  interacted only {TEXP_COLUMN} and held the controls and industry effects common. That")
+    _say(f"  restriction moved b^{BASELINE_CYCLE} away from the section 7.2 number it was labelled")
+    _say("  with - across the pairwise fits it ranged over a factor of about two, and on the")
+    _say("  loosening leg it turned a coefficient indistinguishable from zero into a significant")
+    _say("  wrong-signed one. See the deviations section.")
+    _say()
+    _say("  Errors are clustered on permno - firms repeat across the stacked events. Event date is")
+    _say(f"  NOT a second clustering dimension here: the floor is MIN_EVENT_CLUSTERS =")
+    _say(f"  {MIN_EVENT_CLUSTERS} and the widest stack in this project spans nine event dates. The")
+    _say("  two-way error is computed anyway and reported in se_twoway beside se_permno, and at")
+    _say("  eight event dates it returns roughly a QUARTER of the permno-only error. Two-way")
+    _say("  clustering should widen an interval, never quarter it, so that is the estimator")
+    _say("  failing on too few clusters. Taking it as primary would have reported the tightening")
+    _say("  difference at p < 0.001 on a standard error known to be wrong by a factor of four.")
+    _say("  Cross-sectional dependence within an event date is therefore UNCORRECTED, and this")
+    _say("  panel cannot correct it - a limitation, not a fix. Compare se_permno with se_twoway in")
+    _say("  the results file to see the size of the problem.")
     _say("  The bar section 7.6 sets is directional consistency, not magnitude equality: a")
-    _say("  significant d with both b's correctly signed is a difference in degree, not a failure.")
+    _say("  significant delta with both b's correctly signed is a difference in degree, not a")
+    _say("  failure. Raw coefficients are not in comparable units across vintages - see the per-sd")
+    _say("  columns in the results file.")
 
     for test in ("pooled", "pairwise"):
         rows = [s for s in summaries if s["test"] == test]
@@ -708,43 +1069,95 @@ def _report_stability(summaries: list[dict], active: dict) -> None:
             continue
         _say()
         _say(f"  [{test}]")
-        _say(f"    {'leg':<12}{'window':<10}{'b^2025':>11}{'d (interaction)':>17}{'se(d)':>10}"
-             f"{'t':>8}{'p':>13}{'b^cycle':>11}{'n':>8}")
+        _say(f"    {'leg':<12}{'window':<10}{'b^2025':>11}{'delta':>12}{'se':>10}"
+             f"{'t':>8}{'p':>13}{'b^cycle':>11}{'n':>8}  cov")
         for s in rows:
-            res, window = s["res"], _short(s["window"])
-            combo = res.t_test(f"{TEXP_COLUMN} + {INTERACTION_COLUMN} = 0")
-            d, se = float(res.params[INTERACTION_COLUMN]), float(res.bse[INTERACTION_COLUMN])
-            t, p = float(res.tvalues[INTERACTION_COLUMN]), float(res.pvalues[INTERACTION_COLUMN])
+            q = _pooled_quantities(s)
+            cell = f"{q['p']:.4f}{stars(q['p'])}"
             label = (s["leg"] if test == "pooled"
-                     else s["cycle_runs"][0].replace("de_escalate_", "de").replace("escalate_", ""))
-            _say(f"    {label[:11]:<12}{window:<10}"
-                 f"{float(res.params[TEXP_COLUMN]):>11.5f}{d:>17.5f}{se:>10.5f}"
-                 f"{t:>8.3f}{f'{p:.4f}{stars(p)}':>13}"
-                 f"{float(np.squeeze(combo.effect)):>11.5f}{int(res.nobs):>8,}")
+                     else s["cycle_run_list"][0]
+                     .replace("de_escalate_", "de").replace("escalate_", ""))
+            _say(f"    {label[:11]:<12}{_short(s['window']):<10}"
+                 f"{q['b_left']:>11.5f}{q['delta']:>12.5f}{q['se']:>10.5f}"
+                 f"{q['t']:>8.3f}{cell:>13}"
+                 f"{q['b_right']:>11.5f}{q['n']:>8,}  {q['cov']}")
 
     _say()
     _say("  Verdict per leg and window (pooled fits):")
     for s in [x for x in summaries if x["test"] == "pooled"]:
-        res = s["res"]
-        combo = res.t_test(f"{TEXP_COLUMN} + {INTERACTION_COLUMN} = 0")
-        b_base, b_cycle = float(res.params[TEXP_COLUMN]), float(np.squeeze(combo.effect))
+        q = _pooled_quantities(s)
         want = -1 if s["leg"] == "tightening" else +1
-        p = float(res.pvalues[INTERACTION_COLUMN])
-        agree = int(np.sign(b_base)) == want and int(np.sign(b_cycle)) == want
+        agree = int(np.sign(q["b_left"])) == want and int(np.sign(q["b_right"])) == want
         _say(f"    {s['leg']:<12}{_short(s['window']):<10}"
              f"predicted {SIGN_WORD[want]:<9} "
-             f"2025 {SIGN_WORD[int(np.sign(b_base))]:<9} "
-             f"cycle {SIGN_WORD[int(np.sign(b_cycle))]:<9} "
+             f"2025 {SIGN_WORD[int(np.sign(q['b_left']))]:<9} "
+             f"cycle {SIGN_WORD[int(np.sign(q['b_right']))]:<9} "
              f"{'DIRECTIONALLY CONSISTENT' if agree else 'NOT CONSISTENT'}; "
-             f"H0 d=0 {significance_label(p)}")
+             f"H0 delta=0 {significance_label(q['p'])}")
     _say()
     for s in summaries:
         if s["test"] == "pooled" and s["window"] == ec.CAR_COLUMNS[0]:
-            _say(f"  {s['leg']} pool: {s['baseline_run']} vs "
-                 f"{', '.join(s['cycle_runs'])}")
+            _say(f"  {s['leg']} pool: {s['baseline_run']} vs {', '.join(s['cycle_run_list'])}")
 
 
-def validate(active: dict, stability_summaries: list[dict], paths: list[Path]) -> None:
+def _report_industry_split(rows: list[dict]) -> None:
+    """b within each FF12 group: is the effect diffuse across sectors or concentrated?"""
+    frame = pd.DataFrame(rows)
+    _section("7b. Within-industry estimation (v6 section 5.2 item 1)")
+    _say("  Industry fixed effects establish that b survives within-industry variation on average.")
+    _say("  They cannot say whether the effect is spread across sectors or carried by two or")
+    _say("  three. This estimates b separately inside each FF12 group, with the dummies dropped")
+    _say("  since each sample is one industry by construction.")
+    _say(f"  Groups with fewer than MIN_INDUSTRY_N = {MIN_INDUSTRY_N} firms are skipped: the")
+    _say("  specification carries 7 parameters once the dummies go. Nothing is pooled to rescue a")
+    _say("  thin group, and skipped groups are named rather than omitted.")
+    _say()
+    for run in frame["run"].unique():
+        _say(f"  [{run}]")
+        block = frame[frame["run"] == run]
+        industries = sorted(block["ff12"].unique())
+        _say(f"    {'industry':<12}" + "".join(f"{_short(w):>22}" for w in ec.CAR_COLUMNS)
+             + f"{'n':>7}")
+        for industry in industries:
+            line = f"    {str(industry)[:11]:<12}"
+            n_shown = 0
+            for window in ec.CAR_COLUMNS:
+                row = block[(block["ff12"] == industry) & (block["window"] == window)]
+                if row.empty:
+                    line += f"{'-':>22}"
+                    continue
+                r = row.iloc[0]
+                n_shown = int(r["n"])
+                if r["skipped"]:
+                    line += f"{'skipped':>22}"
+                else:
+                    mark = "" if r["sign_match"] else " x"
+                    coef_cell = f"{float(r['coef']):+.4f}"
+                    star_cell = stars(float(r["p"])) + mark
+                    line += f"{coef_cell:>16}{star_cell:>6}"
+            _say(line + f"{n_shown:>7,}")
+    _say()
+    estimated = frame[frame["skipped"] == ""]
+    _say(f"  Estimated fits: {len(estimated)} of {len(frame)} "
+         f"({len(frame) - len(estimated)} skipped on the size floor)")
+    if not estimated.empty:
+        matched = int(estimated["sign_match"].sum())
+        _say(f"  Predicted sign: {matched} of {len(estimated)} within-group fits match "
+             f"({matched / len(estimated):.0%})")
+        signif = estimated[estimated["p"] < 0.10]
+        _say(f"  Individually significant at 10%: {len(signif)} of {len(estimated)}")
+        if not signif.empty:
+            named = ", ".join(f"{r.ff12}/{_short(r.window)} ({r.coef:+.3f}{stars(r.p)})"
+                              for r in signif.itertuples())
+            _say(f"    {named}")
+    _say("  x marks a coefficient whose sign is opposite to the leg's prediction.")
+    _say("  Read this as a concentration diagnostic, not as twelve independent tests: these are")
+    _say("  subsamples of one cross-section, the per-group n is small, and no multiple-testing")
+    _say("  adjustment is applied to the stars above.")
+
+
+def validate(active: dict, stability_summaries: list[dict], signflip_summaries: list[dict],
+             industry_rows: list[dict], paths: list[Path]) -> None:
     """Assemble the consolidated validation report and write it to disk."""
     fits, samples = active["fits"], active["samples"]
     merge_stats, texp, reasons = active["merge_stats"], active["texp"], active["reasons"]
@@ -762,8 +1175,8 @@ def validate(active: dict, stability_summaries: list[dict], paths: list[Path]) -
     _say("Events        : " + ", ".join(f"{k}={v}" for k, v in ccd.EVENT_DATES.items()))
     _say(f"Screen        : in_screened_universe_pit "
          f"{'imposed (primary specification)' if APPLY_SCREEN else 'NOT imposed'}")
-    _say(f"Std errors    : {COV_TYPE} per event; {STABILITY_COV_TYPE} (by permno) on the "
-         f"pooled H4 test")
+    _say(f"Std errors    : {COV_TYPE} per event (section 7.2 nominates White HC); "
+         f"{STABILITY_COV_TYPE} on the pooled H1 and H4 tests")
     _say(f"Inputs        : {PANEL_PATH.name}, {TEXP_PANEL_CSV.name}, {FS_CSV.name}, "
          + ", ".join(Path(run["out"]).name for run in ec.RUNS))
 
@@ -862,10 +1275,17 @@ def validate(active: dict, stability_summaries: list[dict], paths: list[Path]) -
                            for event, signs in legs.items()))
         matched = sum(1 for event, signs in legs.items()
                       if all(s == EXPECTED_SIGN[event] for s in signs))
-        _say(f"  {window}: sign flip {'HOLDS' if flipped else 'DOES NOT HOLD'} - "
+        _say(f"  {window}: signs {'ALL MATCH' if flipped else 'DO NOT ALL MATCH'} - "
              f"{matched} of {len(legs)} legs match their predicted sign")
     _say("  A sign flip requires every leg to match; matching tightening legs alone are a")
     _say("  news-reaction result, not the reversal identification H1 and H4 are built on.")
+    _say("  This is a check on SIGNS ONLY and carries no inference: two coefficients can both")
+    _say("  match their predicted sign while being indistinguishable from zero and from each")
+    _say("  other. Section 6b tests the difference between the legs formally, and that test, not")
+    _say("  this table, is what H1 rests on.")
+
+    if signflip_summaries:
+        _report_signflip(signflip_summaries, active)
 
     _section("7. Collinearity - nested comparison against the TExp-free model")
     _say("  Variance inflation factors are deliberately not reported. Collinearity is read here")
@@ -898,8 +1318,10 @@ def validate(active: dict, stability_summaries: list[dict], paths: list[Path]) -
             jb, jb_p, skew, kurt = jarque_bera(per_window[window]["specs"]["primary"].resid)
             _say(f"    {_short(window):<10}{skew:>10.3f}{kurt:>11.3f}{jb:>14,.1f}{jb_p:>10.4f}")
     _say("  Rejection of normality does not bias the OLS coefficients; it bears on the exact")
-    _say("  finite-sample p-values. Section 7.2 nominates White heteroskedasticity-robust")
-    _say("  standard errors, which this pass deliberately does not use - see section 11.")
+    _say(f"  finite-sample p-values. Section 7.2's White heteroskedasticity-robust errors")
+    _say(f"  ({COV_TYPE}) are what the table above reports, which is the correct response to")
+    _say("  residuals of this shape - the coefficients are unchanged by that choice, only their")
+    _say("  standard errors.")
 
     _section("9. Sensitivity - extreme CARs and untreated BM/Lev tails")
     _say(f"  Extreme is |CAR| > {EXTREME_CAR:.0%}, the threshold Script 2 flagged on. Trim drops")
@@ -938,6 +1360,9 @@ def validate(active: dict, stability_summaries: list[dict], paths: list[Path]) -
     _say("  so this check is expected to be near-inert at the headline window - that is the")
     _say("  finding, not a failure to run it.")
 
+    if industry_rows:
+        _report_industry_split(industry_rows)
+
     _report_spot_check(active)
 
     if stability_summaries:
@@ -946,20 +1371,63 @@ def validate(active: dict, stability_summaries: list[dict], paths: list[Path]) -
     _section("11. Deviations recorded at the point they were made")
     _say("  - Variance inflation factors replaced by the nested comparison in section 7, per")
     _say("    instruction. The written brief asked for VIF; the substitution is deliberate.")
-    _say(f"  - Standard errors are {COV_TYPE}, per instruction for this pass. Section 7.2")
-    _say("    nominates White heteroskedasticity-robust errors for the reported table.")
+    _say(f"  - Standard errors are {COV_TYPE}: White heteroskedasticity-robust, which is what")
+    _say("    section 7.2 nominates in both v5 and v6. Note that v5 section 8 - a section v6 does")
+    _say("    not revise - instead nominates double-clustering by firm and industry. Section 7.2")
+    _say("    governs as the specific revised instruction, and clustering is in any case inapt on")
+    _say("    a single cross-section: each firm appears once, so firm-clustering reduces to HC,")
+    _say("    and 12 industry groups already absorbed as fixed effects give far too few clusters.")
+    _say("    The conflict is recorded here rather than resolved silently.")
+    if signflip_summaries:
+        _say("  - Section 6b's formal H1 test is an ADDITION to both design documents. Each states")
+        _say("    H1 as a pair of predictions on two separately estimated coefficients and")
+        _say("    nominates no test of their difference. Reporting signs alone cannot distinguish")
+        _say("    a flip from two coefficients indistinguishable from zero and from each other, so")
+        _say("    the difference is now tested. Nothing was removed to make room for it.")
+    if stability_summaries or signflip_summaries:
+        _say(f"  - The pooled tests alone use {STABILITY_COV_TYPE} standard errors. Not a")
+        _say("    preference: stacking two groups puts each firm in the sample once per event, so")
+        _say("    residuals are correlated within firm and the per-event error assumption does not")
+        _say("    carry over. Every per-event regression above is still estimated with")
+        _say(f"    {COV_TYPE} errors, identical across the two cycles.")
+        _say("  - Event date was ADDED as a second clustering dimension and then REJECTED on")
+        _say("    evidence, which is worth recording rather than quietly reverting. Firms within")
+        _say("    one cross-section share that day's common shock, so permno clustering alone")
+        _say(f"    leaves it uncorrected. But the widest stack here spans nine event dates against")
+        _say(f"    a MIN_EVENT_CLUSTERS floor of {MIN_EVENT_CLUSTERS}, and the fitted two-way")
+        _say("    error comes back at about a quarter of the permno-only error. Two-way clustering")
+        _say("    adds a covariance component and should widen an interval; a four-fold narrowing")
+        _say("    is the Cameron-Gelbach-Miller estimator failing on too few clusters. Reporting")
+        _say("    it would have turned an insignificant cross-cycle difference into p < 0.001 on a")
+        _say("    standard error known to be wrong. Both errors are in the results file")
+        _say("    (se_permno, se_twoway) so the reader can see the collapse. Event-date dependence")
+        _say("    is an acknowledged uncorrected limitation of these pooled tests.")
     if stability_summaries:
-        _say(f"  - The pooled H4 test alone uses {STABILITY_COV_TYPE} standard errors, clustered")
-        _say("    on permno. Not a preference: stacking two cycles puts each firm in the sample")
-        _say("    once per event, so the residuals are correlated within firm and the per-event")
-        _say("    error assumption does not carry over. Every per-event regression above is")
-        _say(f"    still estimated with {COV_TYPE} errors, identical to the section 7.2 run.")
-        _say("  - Controls and industry effects are constrained equal across the two cycles;")
-        _say("    only TExp is interacted with the cycle dummy, per section 7.6's 'a cycle")
-        _say("    interaction'. A fully interacted model is a different and much weaker test.")
+        _say("  - Nothing is constrained equal across the two cycles: the pooled design is block")
+        _say("    diagonal, so each cycle's b is exactly its own per-event estimate. This")
+        _say("    REPLACES an earlier specification that interacted only TExp and held the")
+        _say(f"    controls and industry effects common. Under that restriction b^{BASELINE_CYCLE}")
+        _say("    was not the section 7.2 coefficient it was labelled with - it ranged over about")
+        _say("    a factor of two across the pairwise fits, and on the loosening leg at the")
+        _say("    narrowest window it turned a coefficient indistinguishable from zero into a")
+        _say("    significant wrong-signed one, which then drove the reported cross-cycle")
+        _say("    difference. Section 7.6 asks for 'a cycle interaction' and does not require the")
+        _say("    controls to be pooled; the Wald test on the difference is valid either way, and")
+        _say("    only this version leaves the reported b's reconcilable with section 7.2.")
+        _say("  - PolRisk is NOT included, though section 7.6 nominates it and calls it a genuine")
+        _say("    strength of the out-of-sample leg. Descoped by instruction: the Hassan data is")
+        _say("    not in the project, and adding a control absent from the 2025 specification")
+        _say("    would break the specification identity the out-of-sample claim rests on.")
+        _say("  - The section 7.6 lexicon-stability check - 2018-vintage TExp against BEA/Census")
+        _say("    SIC import intensity - is NOT run. Descoped by instruction. Section 7.6 says it")
+        _say("    governs interpretation of H4, so these results are reported without the")
+        _say("    measurement gate the design places in front of them.")
     _say("  - Firms absent from the Compustat segment file are not imputed FS = 0. Absence is")
     _say("    not evidence of a domestic-only firm, and the project's no-imputation rule holds.")
     _say("  - Listwise deletion throughout; no control is imputed and no CAR is winsorised.")
+    _say("  - No multiple-testing adjustment is applied. v5 section 8 nominates Harvey-Liu-Zhu")
+    _say("    adjusted t-thresholds and v6 does not revise that section; the starred surface here")
+    _say("    is wide enough that this matters for how the pairwise table should be read.")
 
     _section("12. Outputs")
     for path in paths:
@@ -1033,6 +1501,21 @@ def main(cycle: str = ccd.DEFAULT_CYCLE) -> list:
     active = run_cycle(cycle)
     paths = [write_results(active["rows"], RESULTS_OUT)]
 
+    # H1: the formal test of the difference between this cycle's two legs. Runs on both cycles -
+    # the registry names a sign-flip pair for each - and needs nothing but this cycle's own fits.
+    signflip_rows_, signflip_summaries = signflip_tests(active["fits"], cycle)
+    paths.append(write_signflip(signflip_rows_))
+    for s in signflip_summaries:
+        q = _pooled_quantities(s)
+        print(f"[signflip] {s['window']}: delta = {q['delta']:+.6f}  p = {q['p']:.4f}  "
+              f"n = {q['n']:,}", flush=True)
+
+    # v6 section 5.2 item 1: b estimated separately by FF12 group, on the baseline cycle only.
+    industry_rows: list[dict] = []
+    if cycle == BASELINE_CYCLE:
+        industry_rows = industry_split(active["fits"])
+        paths.append(write_industry_split(industry_rows))
+
     stability_rows_, stability_summaries = [], []
     if cycle != BASELINE_CYCLE:
         # The baseline cycle is re-estimated rather than read back from its results CSV: the
@@ -1046,13 +1529,11 @@ def main(cycle: str = ccd.DEFAULT_CYCLE) -> list:
         paths.append(write_stability(stability_rows_))
         for s in stability_summaries:
             if s["test"] == "pooled":
-                res = s["res"]
-                print(f"[stability/{s['leg']}] {s['window']}: "
-                      f"delta = {res.params[INTERACTION_COLUMN]:+.6f}  "
-                      f"p = {res.pvalues[INTERACTION_COLUMN]:.4f}  n = {int(res.nobs):,}",
-                      flush=True)
+                q = _pooled_quantities(s)
+                print(f"[stability/{s['leg']}] {s['window']}: delta = {q['delta']:+.6f}  "
+                      f"p = {q['p']:.4f}  n = {q['n']:,}", flush=True)
 
-    validate(active, stability_summaries, paths)
+    validate(active, stability_summaries, signflip_summaries, industry_rows, paths)
     print("\n".join(_REPORT))
     return active["fits"]
 

@@ -1,0 +1,15 @@
+# Python >= 3.10 required (PEP 604 `X | None` in runtime-evaluated annotations).
+# Versions are those the reported results were produced with.
+#   pip install -r requirements.txt
+#   python -c "import nltk; nltk.download('punkt_tab')"   # scoring needs this once
+
+pandas==2.2.3
+numpy==2.4.5
+scipy==1.17.1
+statsmodels==0.14.6
+matplotlib==3.10.9
+nltk==3.10.3
+beautifulsoup4==4.14.3
+lxml==6.1.2
+requests==2.34.2
+openpyxl==3.1.5

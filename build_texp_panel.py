@@ -21,15 +21,19 @@ from pathlib import Path
 
 import pandas as pd
 
+import run_report
+
 import score_filings
 
 BASE = Path(__file__).resolve().parent
 CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
+REPORT_OUT = OUTPUT_DIR / "texp_panel_validation_report.txt"
 LOG_CSV = BASE / "edgar_pull_log.csv"
 SCORES_CSV = CLEAN_DIR / "tariff_scores.csv"
 PANEL_OUT = CLEAN_DIR / "texp_panel.csv"
-DIAG_OUT = OUTPUT_DIR / "texp_panel_diagnostics.csv"
+INTERMEDIATE_DIR = BASE / "intermediate"   # per firm-date drop table, read by later stages
+DIAG_OUT = INTERMEDIATE_DIR / "texp_panel_diagnostics.csv"
 
 # Maximum age of the fiscal period behind a filing, measured to the reference date in exact
 # calendar months. Replaces score_filings.FISCAL_YEARS = (2024, 2025), which was correct for a
@@ -143,12 +147,30 @@ def report(panel: pd.DataFrame, unmatched: pd.DataFrame, stale: pd.DataFrame) ->
     print("Verified: every reference date's z columns have mean 0 and sd 1 within date.")
 
 
+def _up_to_date(outputs, label: str, force: bool) -> bool:
+    """True when every output already exists and the caller has not passed --force."""
+    missing = [p for p in outputs if not p.exists()]
+    if force or missing:
+        if missing and not force:
+            print(f"{label}: rebuilding - missing {', '.join(p.name for p in missing)}")
+        return False
+    print(f"{label}: already built, not regenerated. Outputs:")
+    for p in outputs:
+        print(f"  {p.name}  ({p.stat().st_size / 1e6:,.1f} MB)")
+    print("  Pass --force to rebuild.")
+    return True
+
+
 def main() -> pd.DataFrame | None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild even if the outputs already exist")
     ap.add_argument("--status", action="store_true",
                     help="report per-date counts and exit without writing the panel")
     args = ap.parse_args()
+    if not args.status and _up_to_date([PANEL_OUT, DIAG_OUT, REPORT_OUT], 'build_texp_panel', args.force):
+        return None
 
     if not SCORES_CSV.exists():
         raise FileNotFoundError(f"{SCORES_CSV.name} not found; run score_filings.py first.")
@@ -161,12 +183,13 @@ def main() -> pd.DataFrame | None:
     panel = add_within_date_z(panel).reindex(columns=OUTPUT_COLUMNS)
     panel = panel.sort_values(["reference_date", "permno"])
 
-    report(panel, unmatched, stale)
+    with run_report.capture(REPORT_OUT, title="STEP 2C - TEXP PANEL VALIDATION"):
+        report(panel, unmatched, stale)
     if args.status:
         return None
 
     CLEAN_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(exist_ok=True)
     panel.to_csv(PANEL_OUT, index=False)
     print(f"\nWrote {PANEL_OUT.relative_to(BASE)} "
           f"({len(panel):,} rows x {len(panel.columns)} cols).")

@@ -1,15 +1,182 @@
-# Dissertation
-> **Status:** partial. `CLAUDE.md` requires this to be a full reproducibility document
-> (dependencies, credentials, WRDS source-to-field mappings, end-to-end run instructions,
-> assumptions, fallbacks, deviations). Documented so far: the EDGAR pull, the Step 2 cleaning
-> and scoring pipeline, the Step 4/6 event-study cycles, and the Step 7/8 Fama-MacBeth test and
-> its EPU regime split - each with its source mappings, assumptions and dated deviations.
-> **Every §7.x test in the research design is now implemented.**
->
-> **Still missing, and required:** the dependency list and Python version, `.env` and WRDS
-> credential expectations, Step 1 (`clean_data.py`) source-to-field mappings for the CRSP and
-> Compustat exports, and a single end-to-end run order covering every script from
-> `clean_data.py` to `fama_macbeth_pricing.py`.
+# Dissertation — Is Tariff Exposure Priced?
+
+Text-based tariff exposure from 10-K filings, tested against the 2025 impose-and-reverse
+sequence and the 2018–19 Section 301 cycle. Methodology lives in
+`Tariff_Factor_Research_Design_v5.md` and `Research_Design_v6_revised_sections.md` (v6 revises
+v5's §0, §1, §2.1, §2.3, §3.2, §3.3, §4, §5.2 items 1+6 and §7.0–§7.6; v5 governs elsewhere).
+This file is the reproducibility document: what to install, how to run it, where things land,
+and every place the code departs from the design.
+
+> ### The EDGAR filing pull is not to be re-run
+> `edgar_pull.py` and the 13,975 cached filings in `filings_raw/` are complete and frozen. The
+> pull spans 17 reference dates and ~31,000 successful request rows against SEC's rate limit;
+> re-running it costs hours, and nothing downstream needs it to. Every stage below reads the
+> cached corpus. `edgar_pull.py` is also the one module deliberately left untouched by the
+> 2026-09-01 audit — see "Audit, 2026-09-01" at the end.
+
+## Requirements
+
+- **Python ≥ 3.10** (PEP 604 `X | None` appears in runtime-evaluated annotations). Results
+  reported here were produced on **3.12.10**.
+- `pip install -r requirements.txt` — pandas, numpy, scipy, statsmodels, matplotlib, nltk,
+  beautifulsoup4, lxml, requests, openpyxl. Exact pinned versions are in the file.
+- **NLTK sentence data, once:** `python -c "import nltk; nltk.download('punkt_tab')"`.
+  `score_filings.ensure_punkt` will fetch it on demand and raises a clear error if the network
+  is unavailable; this is the pipeline's only runtime download.
+- **No database access is required.** Every WRDS extract is a static CSV exported by hand and
+  read from the repository root. No script authenticates against WRDS.
+
+### Credentials
+
+Copy `.env.example` to `.env` and set `EDGAR_USER_AGENT` to `AppName ContactEmail`, as SEC fair
+access requires. `.env` is gitignored. It is needed **only** if you deliberately extend the
+filing corpus; no analytical stage reads it. The two `WRDS_*` lines in the template are
+commented out and unused.
+
+## Required inputs
+
+These are licensed or public extracts, all gitignored, all read from the repository root. A
+fresh clone must supply them; the pipeline raises a named `FileNotFoundError` for each.
+
+| File | Source | Used by |
+| --- | --- | --- |
+| `Monthly Returns.csv` | CRSP monthly (WRDS) | `clean_data`, `clean_controls_data`, `build_fm_panel` |
+| `Daily returns.csv` | CRSP daily (WRDS) | `clean_controls_data --cycle 2025` |
+| `CRSP Daily returns cross cycle.csv` + `CRSp Daily returns cross cycle pt2.csv` | CRSP daily (WRDS) | `clean_controls_data --cycle cross_cycle` |
+| `PERMNO - GVKEY - CIK.csv` | CCM link table (WRDS) | `clean_data` |
+| `BM and Lev.csv` | Compustat fundamentals (WRDS) | `clean_controls_data`, `build_fm_panel` |
+| `Compustat Geographic segment data.csv` | Compustat segments (WRDS) | `foreign_sales` |
+| `FF5_MOM_Factors.csv` | Ken French monthly | `clean_data` |
+| `Fama French daily.csv` | Ken French daily | `estimate_car --cycle 2025` |
+| `FF5+MOM daily Cross cycle.csv` + `FF5 + MOM daily cross cycle pt2.csv` | Ken French daily | `estimate_car --cycle cross_cycle` |
+| `ME_Breakpoints.csv` | Ken French NYSE size breakpoints (**public**) | `clean_data` (p10 micro-cap), `decile_sort` (p90 mega-cap) |
+| `Siccodes12.txt` | Ken French FF12 definitions (**public**) | `clean_controls_data`, `build_fm_panel` |
+| `US_Policy_Uncertainty_Data.xlsx` | policyuncertainty.com (**public**) | `clean_data` |
+| `bigram_list.json` | this project's tariff lexicon (**tracked in git**) | `score_filings` |
+
+The four public files are caught by `.gitignore`'s blanket `*.csv` / `*.txt` / `*.xlsx` rules,
+so a fresh clone gets neither them nor the licensed data. Only `bigram_list.json` — the measure
+itself — is version-controlled, which is deliberate: it is the one input that is this project's
+own work rather than a third-party extract.
+
+## Running the pipeline
+
+Every stage is idempotent: it checks for its own outputs and skips, printing what it found.
+Pass `--force` to rebuild (`--redraw` / `--rebuild` for the two fixed firm lists). So the block
+below is safe to paste in full — on a warm tree it verifies rather than recomputes.
+
+```bash
+python clean_data.py                                #  ~5 s   cleaned CRSP/CCM/factors/EPU
+python clean_filings.py                             #  ~1 min re-validates the cached corpus
+python score_filings.py                             #  ~1 s   re-validates existing scores
+python build_texp_panel.py                          #  ~1 s   TExp panel, z within reference date
+python foreign_sales.py                             # ~20 s   FS control + §7.1 validation
+python clean_controls_data.py --cycle 2025           # ~25 s   357 MB controls panel
+python estimate_car.py        --cycle 2025           # ~30 s   FF5+MOM loadings, ARs, CARs
+python run_car_regression.py  --cycle 2025           # ~10 s   §7.2 + H1 test + FF12 split
+python clean_controls_data.py --cycle cross_cycle    # ~35 s   722 MB controls panel
+python estimate_car.py        --cycle cross_cycle    # ~60 s
+python run_car_regression.py  --cycle cross_cycle    # ~15 s   §7.6 + H4 + H1 test
+python decile_sort.py                               # ~20 s   §7.3, both universes
+python build_fm_panel.py                            #  ~2 min monthly panel
+python fama_macbeth_pricing.py                      #  ~3 s   §7.4 + §7.5
+python build_results_workbook.py                    #  ~2 s   merges every results table
+```
+
+Cold from raw inputs, `clean_filings.py` takes **~105 minutes** (13,972 documents) and
+`score_filings.py` **~9 minutes**. Both are fully resumable — they append and flush per
+document and lose at most one on an interruption — so an interrupted run is restarted by
+re-issuing the same command. `--status` on either reports progress and writes nothing.
+
+**Order constraints, not stylistic preferences:**
+
+1. **`--cycle 2025` must complete through `run_car_regression.py` before any `cross_cycle`
+   stage.** `run_car_regression.py --cycle cross_cycle` re-estimates the 2025 cycle in-process
+   to build the H4 pooled test's baseline samples, so the 2025 controls panel and the three 2025
+   CAR tables must be on disk.
+2. **`decile_sort.py` and `fama_macbeth_pricing.py` have no `--cycle` flag.** Both are 2025-only
+   by construction and read the unsuffixed artifacts.
+3. **`build_results_workbook.py` runs last**, since it reads every results CSV.
+
+### The two fixed firm lists, and the bootstrap they sit in
+
+`persist_2025_universe.py` (2,140 firms) and `sample_full_panel_firms.py` (the 1,000-firm draw,
+`SEED = 20250402`) are **written once and reused unchanged**. Both now refuse to overwrite
+without an explicit flag, and **neither is in the normal run order** — they are already built.
+
+This matters because of a genuine circularity the code does not otherwise state.
+`estimate_car.py --cycle 2025` rewrites `intermediate/car_imposition_primary.csv`, which is the
+sole input to `persist_2025_universe.py`; and the 1,000-firm sample is drawn as *indices into the
+universe's enumeration order*. So re-running `persist_2025_universe.py` after a CRSP refresh
+would silently rewrite the pool, and the recorded seed would then select a **different** 1,000
+firms from a pool that no longer matches the `N=2140` in the sample file's own header. Nothing
+downstream detects that. Hence the guards. If you ever do rebuild the universe, re-draw the
+sample immediately (`--rebuild` then `--redraw`) and rebuild `intermediate/fm_panel.csv`.
+
+Full cold order, including the pull (**for reference only — do not run**):
+
+```
+clean_data.py
+  → edgar_pull.py --scope full  (2025-04-02 bootstrap)
+  → clean_controls_data.py --cycle 2025 → estimate_car.py --cycle 2025
+  → persist_2025_universe.py → sample_full_panel_firms.py
+  → edgar_pull.py --batch cross_cycle --scope full      (cross_cycle FIRST, per CLAUDE.md)
+  → edgar_pull.py --batch full_panel --scope subsample
+  → clean_filings.py → score_filings.py → build_texp_panel.py → foreign_sales.py
+  → the analytical stages, in the order given above
+```
+
+## Where things land
+
+| Directory | Contents | Tracked? |
+| --- | --- | --- |
+| `output/` | **Final results only**: results CSVs, the merged workbook, 14 validation reports, 4 figures, and the two fixed firm lists | no |
+| `intermediate/` | Derived analytical panels and per-row audit tables: `controls_panel{,_cross_cycle}.csv`, 12 per-firm `car_*.csv`, `fm_panel.csv`, `scoring_diagnostics.csv`, `texp_panel_diagnostics.csv` | no |
+| `clean_data/` | Cleaned source data: returns, bridge, factors, EPU, filings metadata, TExp scores and panel, FS | no |
+| `clean_text/` | 13,972 gzipped `{item_1a, rest}` documents — the cleaned corpus | no |
+| `filings_raw/`, `submissions_cache/` | Raw SEC HTML and cached submissions payloads. **Read-only.** | no |
+| `logs/` | Launcher logs from long unattended runs. Written by the shell, read by no script. | no |
+
+`output/results_workbook.xlsx` is the single human-facing deliverable: one sheet per reported
+table plus a contents sheet naming each table's design section and source CSV. The source CSVs
+**remain** beside it — they are the machine-readable form, diffing them is how every numerical
+change in this project is verified, and `car_regression_results.csv` is a genuine *input* to
+`fama_macbeth_pricing.py` (report §8 converts §7.2 coefficients into comparable units).
+
+The two `controls_panel` files are excluded from the workbook at 1.1M and 2.2M rows — past
+Excel's 1,048,576-row limit — as are the per-firm CAR tables and the diagnostics.
+
+### Reports
+
+Every stage writes a persisted report to `output/`. The six that assemble one deliberately
+(`clean_controls_data`, `estimate_car`, `run_car_regression`, `decile_sort`, `foreign_sales`,
+`fama_macbeth_pricing`) buffer into a `_REPORT` list. The seven that build their output with
+plain `print` are teed to disk by `run_report.capture`, so the console text and the file are
+identical — see `run_report.py` for why that route was taken rather than rewriting ~150 call
+sites.
+
+## Configuration a re-runner would change
+
+All of these are declared in a marked `Configuration` block at the top of their module.
+
+| Constant | Module | Meaning |
+| --- | --- | --- |
+| `SEED = 20250402` | `sample_full_panel_firms` | the §7.0 draw; also recorded in the output file's `#` header |
+| `COV_TYPE = "HC1"` | `run_car_regression` | §7.2 standard errors (see the SE note below) |
+| `STABILITY_COV_TYPE`, `MIN_EVENT_CLUSTERS = 30` | `run_car_regression` | pooled-test clustering and the floor below which the event dimension is dropped |
+| `MIN_INDUSTRY_N = 30` | `run_car_regression` | size floor for a within-FF12-group fit |
+| `EVENT_WINDOWS = [(-1,1), (-5,5), (-10,10)]` | `estimate_car` | the three CAR windows |
+| `CYCLES` | `clean_controls_data` | **the single definition of a policy cycle** — dates, inputs, expected signs, estimation-window rule, output suffix |
+| `NW_LAGS = 6`, `HAC_KWDS` | `fama_macbeth_pricing` | Newey-West lag and its finite-sample switches |
+| `TAU_PERCENTILES`, `PRIMARY_TAU = 75` | `fama_macbeth_pricing` | §7.5 EPU thresholds |
+| `MIN_FIRMS_PER_MONTH = 50` | `fama_macbeth_pricing` | degrees-of-freedom floor; binds on no month |
+| `MAX_PERIOD_STALENESS_MONTHS = 15` | `build_texp_panel` | contemporaneity rule, per reference date |
+| `CARRY_MONTHS = 12`, `SAMPLE_START/END` | `build_fm_panel` | exposure carry-forward bound and the panel window |
+| `REFERENCE_WINDOW`, `RHO_STRONG`, `MONOTONE_MAX_FLIPS` | `decile_sort` | weights for the size diagnostics, and the monotonicity verdict thresholds |
+
+---
+
+# Per-stage documentation
 
 ## EDGAR pull: submissions cache and rate limiting
 
@@ -216,7 +383,7 @@ Cross-cycle event dates and pull reference dates coincide by construction, so ev
 uses the 10-K selected at reference date `2018-03-01` — filed inside `[ref−364, ref−1]`, strictly
 before the event, no look-ahead. Both 2025 legs share the single `2025-04-02` vintage, because H1
 requires exposure held fixed across the imposition and reversal legs and there is no 2025-08-29
-pull. `load_texp_reasons` is sliced the same way, against `output/texp_panel_diagnostics.csv` and
+pull. `load_texp_reasons` is sliced the same way, against `intermediate/texp_panel_diagnostics.csv` and
 the reference-date slice of `edgar_pull_log.csv`.
 
 ### The H4 stability test
@@ -245,9 +412,9 @@ regression report.
 
 2. **Standard errors clustered on permno, on the pooled stability test only.** Stacking two cycles
    puts each firm in the sample once per event, so the per-event independence assumption does not
-   carry over. All 27 per-event cross-cycle regressions keep `COV_TYPE = "nonrobust"`, identical to
-   the section 7.2 run. Section 7.2 still nominates White HC for the reported table; that remains
-   outstanding on both cycles.
+   carry over. All 27 per-event cross-cycle regressions use the same `COV_TYPE` as the section 7.2
+   run, which since the 2026-09-01 audit is `HC1` - the White heteroskedasticity-robust errors
+   section 7.2 nominates. The pooled test's clustering was also revisited; see the audit section.
 
 3. **Controls and FF12 effects constrained equal across cycles** in the pooled regression; only
    TExp is interacted, per section 7.6's "a cycle interaction". A fully interacted model is a
@@ -295,10 +462,12 @@ python fama_macbeth_pricing.py           # 96 monthly cross-sections, Newey-West
 
 | Path | Contents |
 | --- | --- |
-| `clean_data/fm_panel.csv` | 86,009 candidate firm-months x 31 cols; `exclusion_reason` empty on the 53,745 that estimate |
+| `intermediate/fm_panel.csv` | 86,009 candidate firm-months x 31 cols; `exclusion_reason` empty on the 53,745 that estimate |
 | `output/fm_lambda_panel.csv` | 192 rows - monthly lambda_1, its within-month se/t/p, lambda_FS, firm count, R2, lagged EPU, episode label, per specification |
 | `output/fm_lambda_chart.png` | the section 7.4 figure: lambda_1,t over 96 months with both tariff episodes shaded |
-| `output/fama_macbeth_validation_report.txt` | eleven sections, house style |
+| `output/fm_headline_results.csv` | lambda_1_bar with its Newey-West inference - the H2 statistic - per specification and across the NW lag grid. Added by the 2026-09-01 audit; it previously reached no file |
+| `output/fm_panel_validation_report.txt` | the panel stage's own record, teed to disk by `run_report` |
+| `output/fama_macbeth_validation_report.txt` | fourteen sections, house style |
 
 **No existing script was modified.** Both scripts import `clean_controls_data`, `clean_data` and
 `run_car_regression` read-only and reuse their functions, so the section 7.2 and 7.6 outputs cannot
@@ -500,3 +669,380 @@ its cycle's first event to its last, so it holds both the tightening and looseni
 nets a predicted-negative month against a predicted-positive one; and both episodes sit under the
 HAC floor at 23 and 5 months. Its null is not evidence that tariff salience does not matter - §7.2,
 where the legs are separated and the window is days rather than months, is where that is answered.
+
+---
+
+## Audit, 2026-09-01
+
+A full-folder review of methodology conformance, statistical correctness, repo hygiene and
+publication safety. `edgar_pull.py` and `filings_raw/` were held read-only throughout and are
+unmodified. Every numerical change below was applied one at a time and diffed against a captured
+baseline, so each movement is attributable to a single cause.
+
+### Standard errors: HC1, and a conflict inside the design
+
+`run_car_regression.COV_TYPE` was `"nonrobust"`, with a comment conceding that §7.2 nominates
+White HC. It is now **`HC1`**.
+
+Both v5 §7.2 and v6 §7.2 say "White heteroskedasticity-robust". But **v5 §8 — a section v6 does
+not revise — instead says event-study regressions are "double-clustered by firm and industry".**
+The design therefore nominates two mutually exclusive estimators for the same regression. §7.2
+governs, on two grounds: it is the specific, revised instruction for exactly this regression, and
+clustering is inapt on a single cross-section, where each firm appears once (so firm-clustering
+reduces to HC) and the 12 FF12 groups are already absorbed as fixed effects (far too few
+clusters). The conflict is recorded rather than resolved silently.
+
+Effect: `coef`, `n`, `r2` and `adj_r2` are **identical** on all 639 + 1,917 result rows — OLS
+point estimates do not depend on the covariance — while `se`, `t`, `p` and `stars` move. One star
+changes (`imposition_robustness` at `[-1,+1]`, p 0.1033 → 0.0980). The headline coefficients are
+essentially unmoved, which is worth reporting: the result is robust to the estimator the design
+actually specifies. This deliberately supersedes CLAUDE.md's byte-identity invariant for
+`--cycle 2025`, replaced by the narrower and more informative *coef/n/r² identical, se/t/p
+changed*.
+
+### H1 now has a test statistic
+
+The sign flip — which v6 §3.3 calls "the primary causal evidence and the core contribution" —
+was evaluated by comparing two signs. `signflip_matrix` printed `b` per leg with a Y/N verdict,
+and the report declared `sign flip HOLDS` from `np.sign` alone; at `[-5,+5]` it did so on
+coefficients with p = 0.807 and p = 0.349. No p-value on the *difference between legs* existed in
+any output file. Worse, `estimate_car.py` wrote into a published report that "the joint sign-flip
+test in Script 3 runs on the intersection" — a test that did not exist, on a sample that was not
+used.
+
+**`signflip_tests` is an addition to both design documents** — each states H1 as a pair of
+predictions on two separately estimated coefficients and nominates no test of their difference.
+Nothing was removed to make room for it. Output: `output/signflip_test_results{,_cross_cycle}.csv`
+and report §6b. Section 6's wording is now "signs ALL MATCH", explicitly carrying no inference,
+pointing at §6b.
+
+Result (2025 cycle, δ = b_reversal − b_imposition, H1 predicts δ > 0):
+
+| window | b_impose | b_reverse | δ | p (2-sided) | p (1-sided) |
+| --- | --- | --- | --- | --- | --- |
+| `[-1,+1]` | −0.1881 | −0.0543 | +0.1339 | 0.298 | 0.149 |
+| `[-5,+5]` | −0.0411 | +0.1731 | +0.2142 | 0.369 | 0.184 |
+| `[-10,+10]` | −0.4930 | +0.2964 | **+0.7894** | **0.032** | 0.016 |
+
+δ is correctly signed at every window and significant at 5% at the widest — and the trajectory
+0.298 → 0.369 → 0.032 is the H3b digestion prediction, now with inference attached rather than
+eyeballed. The 2018–19 cycle's own legs give δ = +0.173 (p = 0.056), +0.252, +0.338: correctly
+signed at all three, out-of-sample.
+
+### H4: the pooled test no longer re-estimates b^2025
+
+The old pooled regression constrained FS, all controls and all FF12 dummies equal across cycles,
+interacting only TExp. The consequence, measured: **the quantity labelled `b^2025` took eight
+values from −0.119 to −0.235 against §7.2's −0.188**, and on the loosening leg it was −0.146
+(p = 0.021) where §7.2 reports −0.054 (p = 0.495) — the restriction manufactured a significant,
+wrong-signed reversal coefficient out of a null, and *that* value drove the reported "the two
+cycles genuinely differ at `[-1,+1]`" finding.
+
+The design is now **block diagonal**: every regressor, the constant and the industry dummies
+included, enters once per group and nothing is constrained across them. The blocks are orthogonal
+by construction, so each group's `b` is exactly its own per-event estimate — asserted at
+`POOLED_COEF_TOL = 1e-9`, measured worst case 2e-15 — and the stack exists only to supply the
+joint covariance δ's standard error needs. The Wald test on δ is valid either way; only this
+version leaves the reported `b`s reconcilable with §7.2.
+
+| leg | window | δ (old) | p (old) | δ (new) | p (new) |
+| --- | --- | --- | --- | --- | --- |
+| tightening | `[-1,+1]` | +0.100 | 0.316 | +0.117 | 0.313 |
+| tightening | `[-5,+5]` | +0.022 | 0.894 | −0.124 | 0.492 |
+| tightening | `[-10,+10]` | +0.234 | 0.333 | +0.191 | 0.489 |
+| loosening | `[-1,+1]` | +0.379 | **<0.001** | +0.173 | 0.068 |
+| loosening | `[-5,+5]` | +0.115 | 0.543 | +0.035 | 0.876 |
+| loosening | `[-10,+10]` | +0.012 | 0.964 | −0.039 | 0.899 |
+
+H₀: δ = 0 is now rejected nowhere at 5%. That is a **stronger** H4 result — directional
+consistency with no detectable difference between cycles — and the previous headline
+"the cycles differ" was substantially an artefact of the restriction.
+
+A per-standard-deviation column was added alongside the raw coefficients. Raw TExp's
+cross-sectional sd ranges 0.00478 (2018-04) to 0.01215 (2025-04), a 2.5× spread, so a raw
+equality test is not scale-invariant; the per-sd column makes the comparison legible without
+re-estimating anything.
+
+### Two-way clustering: added, then rejected on evidence
+
+Event date was added as a second clustering dimension for the pooled tests, since every firm in one
+cross-section shares that day's common shock and permno clustering leaves that uncorrected. It was
+then **withdrawn as primary**, because the fitted two-way error came back at roughly a **quarter**
+of the permno-only error at eight event dates. Two-way clustering adds a covariance component and
+should widen an interval; a four-fold narrowing is the Cameron-Gelbach-Miller estimator failing on
+too few clusters. Reporting it would have turned an insignificant cross-cycle difference into
+p < 0.001 on a standard error known to be wrong by a factor of four.
+
+`MIN_EVENT_CLUSTERS = 30` is the conventional floor and is met nowhere in this project (nine event
+dates is the widest stack). Both errors are reported on every row — `se_permno`, `se_twoway`, with
+`cov_type` naming the primary — so the collapse is visible. **Cross-sectional dependence within an
+event date is an acknowledged, uncorrected limitation of the pooled tests.**
+
+### Shanken correction: not applicable, and its absence is correct
+
+v5 §8 says "FM regressions: Shanken correction mandatory", but v5 §7.4 scopes that to **Version B**
+("mandatory for Version B: it adjusts for the errors-in-variables bias introduced by using
+estimated (rather than true) betas in Stage 2") and says of Version A that "no first-pass beta
+estimation is required — TExp is a directly observable characteristic". v6 §7.4 drops Version B.
+
+Traced in code: `estimate_car.estimate_betas` produces FF5+MOM loadings consumed **only** by
+`compute_ar` to form residuals. They are written to the CAR tables as diagnostics and never appear
+in `design_matrix`'s regressor list. `fama_macbeth_pricing`'s regressor is `texp_z`, a
+text-derived score. **No two-pass errors-in-variables setup exists anywhere in the pipeline**, so
+Shanken corrects a bias that is not present. Adding it would be wrong, not conservative.
+
+### v6 §5.2 item 1: within-industry coefficients
+
+v6 calls this "the most important robustness check in the paper — run it before anything else" and
+it was not implemented. `industry_split` now estimates `b` separately inside each FF12 group, on
+the 2025 cycle, dropping the industry dummies (each sample is one industry by construction — which
+is why `design_matrix` gained `include_industry`, since the reference-category check fires on
+eleven of twelve otherwise). Groups below `MIN_INDUSTRY_N = 30` are reported as skipped, never
+pooled to rescue. Output: `output/industry_split_results.csv`, report §7b.
+
+**The result matters: 53 of 99 estimated within-group fits carry the predicted sign** — close to a
+coin flip. The imposition `[-1,+1]` effect is carried by BusEq (−0.51\*) and Enrgy (−1.51\*), with
+Chems significantly the *wrong* way (+0.65\*). So the effect is **concentrated, not diffuse across
+sectors**, which per v6 "is still a result, but it is a different result and should not be
+presented as a general one". Read it as a concentration diagnostic, not twelve independent tests:
+these are subsamples of one cross-section and no multiple-testing adjustment is applied.
+
+### §7.5: Newey-West on scattered months
+
+Each regime's mean and NW error came from applying the HAC estimator to `frame.loc[indicator]` and
+`frame.loc[~indicator]` separately. Those subsets are scattered across the calendar — the p75
+high-EPU bucket holds eight months of 2020, two of early 2021, two from the whole 2018–19 trade war
+and ten from 2025 — and a Bartlett kernel reads row adjacency as month adjacency, so observations
+years apart were getting consecutive-month weights.
+
+`regime_fit` now takes everything from **one HAC fit on the un-split contiguous series**:
+`λ_t = a + b·1{high}`, with `a` the low mean, `a + b` the high mean and `b` the difference, each
+error read off the joint covariance by `t_test`. Every regime mean is unchanged to machine
+precision (a dummy regression's fitted levels *are* the group means, asserted); only the errors
+move, by 0.95× to 1.09×. The headline p75 high-EPU error widens 7% and its p goes 0.102 → 0.126.
+`fm_lambda_panel.csv` is **byte-identical** — the monthly slopes were never involved.
+
+The two per-episode splits still carry calendar gaps by construction (each excludes the other
+episode's months) and are now flagged per row via `series_contiguous`, with the caveat printed in
+their own report blocks.
+
+The HAC finite-sample switches are named in `HAC_KWDS` rather than inherited silently:
+`use_correction`, `adjust_df` and `use_t` are all `False`, which are the statsmodels defaults, so
+no number changed. They are left there deliberately — at 96 months all three are negligible, and
+switching them only for the small buckets would put two conventions in one table. The consequence,
+now stated, is that the sub-floor rows' p-values are optimistic on two counts at once: no
+small-sample scaling and a normal rather than *t* reference distribution.
+
+### §7.3: value weights were measured inside the window
+
+`decile_sort` weighted on `me_lag` read from the event-date panel row. For `[-1,+1]` that is
+marginally pre-window; for `[-5,+5]` and `[-10,+10]` it sat **five and ten trading days inside the
+window**, so a firm that fell over the first half of the window was down-weighted in the average
+of its own decline. Weights are now read on the trading day each window **opens**
+(`weight_dates`), so `me_lag` is the close of the day before the window's first day and no return
+inside a window helps set its own weights. One rule serves all three windows, leaving intact the
+existing argument for not using the estimation anchor.
+
+Effect is real but small, and every sign survives: imposition spreads −1.55/−1.83/−2.90% →
+−1.57/−1.95/−2.94%, reversal −0.33/+1.93/+3.46% → −0.33/+1.93/+3.36%. In universe B the trim now
+sees slightly different market equity, so two firms cross the NYSE p90 cutoff differently and the
+group bounds shift accordingly.
+
+Also in `decile_sort`: the monotonicity verdict label branched on |ρ| first and consulted the flip
+count only inside the top band, so a series with five sign changes read "strong trend" while one
+with four — strictly more monotone — read "partial gradient", purely because its ρ fell 0.003 below
+a cutoff. `monotonicity_reading` now takes both statistics on every branch, with the thresholds in
+config. The Spearman p is explicitly labelled as not a test: the ten group means are weighted
+averages of one event-day cross-section, several dominated by one or two firms, and are not ten
+independent draws.
+
+### Inference reaching output files
+
+`λ̄₁` with its Newey-West error — the single statistic H2 is about — existed only as report prose
+and a chart subtitle. It now has `output/fm_headline_results.csv`, carrying both specifications
+and the whole NW lag grid.
+
+The per-standard-deviation conversion used the 2,868-firm vintage sd (0.012149) where §7.2's own
+estimation sample sd is ≈0.0127, understating by 4.5%. The vintage figure is retained — it is the
+only stable factor across windows and legs — and report §8 now prints both, so the understatement
+is quantified rather than hidden.
+
+Per the brief, **no non-standard-error robustness check was added**, and no existing one removed.
+
+### Repo hygiene
+
+`output/` went from **1,048 MB to 4.7 MB** and now holds only final results. Derived panels and
+per-row audit tables moved to a new `intermediate/`, added to `.gitignore`. One constant changed
+per file — `clean_controls_data.PANEL_OUT` alone repoints both controls panels, since the three
+consumers derive their path from it.
+
+Deleted, all verified to have zero references in any `.py` including the out-of-scope pull:
+
+| Target | Reclaimed | Basis |
+| --- | --- | --- |
+| `clean_data/clean_filings.pre-migration.csv` | 1,135 MB | `migrate_clean_filings.py` states the deletion precondition; verified met — 13,972 text files = 13,972 distinct accessions, 0 partials, live schema carries no `item_1a_text` |
+| `output/cleaning_diagnostics.csv` | 2.6 MB | **`cmp`-identical** to `clean_data/clean_filings.csv` — `write_diagnostics` wrote the whole cleaned table, whose schema already *is* the diagnostics schema — and nothing read it |
+| `CIKs.txt`, `PERMNOs.txt`, `clean_data/tariff_scores.pre-panel-backup.csv` | 585 KB | zero references anywhere; schemas proven superseded |
+| `__pycache__/`, 14 dead `logs/` files | 650 KB | no `.py` touches `logs/`; 5 stale `.pid`, 1 `.logname` pointing at a file that does not exist, 3 empty orphan `.err.log`, 5 pre-timestamp legacy names |
+| `edgar_pull_log.pre-migration.csv` | 7 KB | `edgar_pull.migrate_log` returns early once `reference_date` exists on the log — which it does — so `LOG_BACKUP` is written-once and never read, and the migration cannot recur. A 73-row backup of a 49,742-row live file |
+| `__pycache__/`, 26 → 12 `logs/` files | 1.0 MB | Build cache (regenerates). Of the launcher logs, the 14 covering the **analytical** stages were removed: each of those stages now writes its own validation report, and the logged figures predate the audit, so keeping them alongside the new reports risks someone quoting a superseded number |
+
+**Deliberately kept in `logs/`:** the four `pull-*` logs and the `clean-*` / `score-*` pair. Those
+record operations that are unrepeatable or expensive — the frozen EDGAR pull, and the 105-minute
+cleaning and 9-minute scoring runs — and they carry per-document progress detail that the warm
+re-validation reports cannot reconstruct. Nothing reads them; they are provenance.
+
+**Deliberately kept elsewhere, with reasons.** `migrate_clean_filings.py` is inert
+(`already_migrated()` refuses to run) and functionally dead, but it is the audit trail for how
+`clean_text/` came to exist and for the character-count verification this README cites, and it sits
+inside the cleaned-filings area that is out of scope for deletion. `clean_data/clean_ff5_mom.csv`
+has no consumer, but it is one of the four outputs `clean_data.py`'s skip check tests for — deleting
+it would silently force a full rebuild of that stage on the next run — so it stays until the
+generator itself is retired.
+
+**Left in place and flagged.** `edgar_pull_log.pre-migration.csv` has no reader, but the literal
+appears in `edgar_pull.py`, which was out of scope to read — it cannot be cleared safely.
+`output/event_study_firm_universe.csv` and `output/full_panel_firm_sample.csv` stay in `output/`
+because `edgar_pull.read_firm_list` reads them and CLAUDE.md pins those paths; they legitimately
+qualify as the "reproducibility artifacts" CLAUDE.md permits there.
+**`clean_data/clean_ff5_mom.csv` is an orphan output** — written by `clean_data.clean_ff5_mom`,
+read by nothing, since `estimate_car` reads the raw daily factor files instead. Flagged rather
+than deleted: removing the generator would also remove the documented `rf` handling.
+
+Other fixes: `persist_2025_universe.py` gained the overwrite guard its downstream sample already
+had (highest-severity hygiene finding — the file that must be immutable had none while the draw
+from it did); `--force` skip-if-exists added to the five whole-file stages that recomputed
+unconditionally; the cycle-dependent default-argument trap CLAUDE.md forbids closed at
+`decile_sort.load_event_weights` and `persist_2025_universe.load_screened_permnos`;
+`load_texp_reasons` now reads its two sources once per process instead of eighteen times per
+cross-cycle run; 20 bare `assert`s converted to `raise ValueError` (they vanish under `python -O`,
+and the other modules already used raise for the same class of check); three result-dependent
+assertions that would have aborted on a legitimate empirical finding converted to reported
+findings; `decile_sort`'s report renumbered (it skipped section 10); buried literals promoted to
+config, including a hardcoded PERMNO 170 lines into a validation function that drives published
+report text.
+
+Duplication that carried a correctness risk was consolidated: `palette.py` is now the single
+definition of the chart colours that three modules each held their own copy of under different
+role names, so a palette revision is one edit rather than three coordinated ones across four
+published figures. All four regenerate **byte-identically**, which is the proof the change was
+behaviour-preserving.
+
+The audit found **no dead code**: ~150 functions checked by AST load-reference, every one with a
+call site; zero commented-out blocks, zero unused imports, zero unused module constants, zero
+TODO/FIXME markers.
+
+### Publication safety
+
+**Nothing sensitive has ever been committed.** `git log --all --diff-filter=A --name-only` over
+the full history returns the same paths as `git ls-files`: `.gitignore`, `README.md`,
+`bigram_list.json` and the Python sources. No CSV, no `.env`, no `output/` artifact, no design
+document has ever entered git, so **no history rewrite is needed** — worth stating plainly in a
+data-management declaration. Zero absolute paths in source (every path derives from
+`BASE = Path(__file__).resolve().parent`); zero credentials; the only `OneDrive` mentions are
+comments about file locking.
+
+Fixed: `.claude/settings.local.json` held a real email address inside a Bash allow-rule (untracked
+and gitignored, so never a publication risk) — that rule and a standing pre-approved
+`rm -f .env` rule were removed, and `.gitignore` widened from the single filename to `.claude/`
+so anything later added to that directory is not tracked by default. `.env.example` added (the
+`!.env.example` negation already existed but the file did not). `requirements.txt` added, with
+`!requirements.txt` ahead of the blanket `*.txt` rule that would otherwise have swallowed it.
+
+**Flagged, and yours to decide:** all commits are authored with a personal email and there is no
+repo-local git identity. That is not fixable by ignoring anything — if the repository is published
+and pseudonymity is required, it needs a local identity set before the next commit and a rewrite
+of the existing author fields.
+
+### Methodology gaps: flagged, not resolved
+
+Each is a live requirement of a section v6 did **not** revise, or a v6 requirement descoped by
+prior instruction. None was silently implemented, and none was silently dropped.
+
+| # | Requirement | Source | Status |
+| --- | --- | --- | --- |
+| M1 | Harvey-Liu-Zhu adjusted t-thresholds for multiple testing | v5 §8 | Not implemented; zero matches repo-wide. The starred surface is wide — 30 δ-tests, 27×4 per-event coefficients, 99 within-industry fits, 12 regime rows — and in the H4 pairwise block four `**` hits appear against ≈1.5 expected by chance at 5% over 24 tests. Now noted in the regression report's deviations. |
+| M2 | 120-day filing-staleness robustness | v5 §7.1 | Not implemented. The code's rule is different in kind: `MAX_PERIOD_STALENESS_MONTHS = 15`, period-to-reference, not filing-to-event. |
+| M3 | Anticipation windows `[-10,+1]` and `[0,+1]` | v5 §5.2 item 5 | Not implemented; `EVENT_WINDOWS` is the three symmetric windows v6 §7.2 names. |
+| M4 | PolRisk as a §7.6 control | v5 §7.6, **v6 §7.6** | Descoped by instruction. v6 calls it "a genuine strength of the out-of-sample leg". The Hassan data is not in the project, and adding a control absent from the 2025 specification would break the specification identity the out-of-sample claim rests on. Now disclosed in the regression report itself, which previously did not mention it. |
+| M5 | 2018-vintage lexicon vs BEA/Census SIC import intensity | v5 §7.1, **v6 §7.6** | Descoped by instruction. **v6 says this "governs interpretation" of H4**, so the 27 cross-cycle regressions are reported without the measurement gate the design places in front of them. Now disclosed in the report. |
+| M7 | Placebo events (FOMC, non-farm payrolls) | v5 §8 | Not implemented. |
+| M8 | §7.1 sample scope | v6 §7 table says "full universe"; `CLAUDE.md` mandates one 2025 cross-section | Code follows CLAUDE.md, which reads as a deliberate prior override — but CLAUDE.md disclaims methodology authority, so this needs a ruling. Unchanged; the pooled nine-vintage correlation is technically available. |
+| M9 | Carry-forward refresh boundary | v6 §4 / §7.4 say "until the next annual filing arrives" | The code refreshes every firm on 1 May regardless of its own filing date, up to an 11-month lag for non-December fiscal year-ends. Documented in `build_fm_panel`'s comments but not previously framed as a deviation. |
+
+**M6 (equal- vs value-weighted deciles) is closed** — see the §7.3 subsection above. The numbering is left as it was so the audit's own references stay valid.
+
+### §7.3: equal- versus value-weighting (closes M6)
+
+v5 §8 nominates "equal-weighting vs. value-weighting" as specification robustness and v6 does not
+revise that section, so this was a live requirement rather than an addition. `decile_sort` now
+reports both schemes.
+
+**Both are computed on identical firms.** A firm enters a cell only with a non-null CAR and a
+strictly positive value weight, whichever scheme is applied, so any difference between the two is
+the weighting and not the sample — the same discipline `run_car_regression` uses for its H5 read.
+The identity is asserted per cell, not assumed. An unrestricted equal-weighted mean would
+additionally admit firms with no usable weight; the count that would add is reported rather than
+taken.
+
+Outputs. Each results file keeps one row per (run, window, group, **weighting**) — 180 rows, not 90
+— so **a consumer must filter on `weighting`**. Two new columns: `eff_n`, the inverse Herfindahl of
+the weights actually applied (equal to `n_entering` exactly under equal weighting), and the
+existing `weight_sum`, which is the cell's market equity and therefore identical across schemes.
+Four charts, one per (universe, weighting):
+
+| Chart | Universe | Weighting |
+| --- | --- | --- |
+| `decile_sort_chart.png` | all screened firms | value (the §7.3 primary) |
+| `decile_sort_chart_equal_weighted.png` | all screened firms | equal |
+| `decile_sort_chart_ex_megacap.png` | ex-NYSE-p90 | value |
+| `decile_sort_chart_equal_weighted_ex_megacap.png` | ex-NYSE-p90 | equal |
+
+**The result.** Group 9 − group 0 spread, in percentage points:
+
+| run | window | A value | A equal | B value | B equal |
+| --- | --- | --- | --- | --- | --- |
+| imposition | `[-1,+1]` | −1.57 | −1.51 | −0.69 | −1.49 |
+| imposition | `[-5,+5]` | −1.95 | −0.99 | −0.88 | −0.90 |
+| imposition | `[-10,+10]` | −2.94 | −2.10 | −1.27 | −2.03 |
+| reversal | `[-1,+1]` | −0.33 | −0.70 | −1.00 | −0.71 |
+| reversal | `[-5,+5]` | +1.93 | +1.28 | +0.67 | +1.45 |
+| reversal | `[-10,+10]` | +3.36 | +2.82 | +1.87 | +3.14 |
+
+**All nine (run × window) cells agree in sign across all four combinations.** The direction of the
+spread — including the flip between legs — is therefore an artefact of neither mega-cap
+concentration nor the weighting scheme, which is the strongest form a descriptive exhibit can take.
+The known `[-1,+1]` reversal failure is wrong-signed in all four, so nothing here rescues it either.
+
+Two further readings, both computed in report §12 rather than asserted:
+
+- **The trim moves the value-weighted spread 12× further than the equal-weighted one** (mean
+  |A − B| of 1.16 pp against 0.10 pp). That is a coherence check, not a coincidence: universe B
+  exists to remove weight concentration, and equal weighting has none to remove. The two fixes are
+  addressing the same thing and they agree on what the spread is once it is removed.
+- **Within universe B the value-weighted spread stays below the equal-weighted one**, so the size
+  gradient does not end at the p90 cutoff — among the firms that survive the trim, the larger ones
+  still carry a weaker spread.
+
+Value weighting remains the §7.3 primary and the headline figure; equal weighting is the robustness
+line. No inference is attached to any of these spreads: §7.3 is descriptive by design and nominates
+no test, and H1 is tested in the regression report's §6b.
+
+### Retired methodology: zero live violations
+
+v6 retires the v5 §7.3 portfolio programme. A full sweep for Sharpe, drawdown, turnover,
+capacity, GRS, spanning regressions, long-short legs, portfolio return series, rolling TExp betas
+and factor-return construction found **no live computation of any of them**. Every keyword hit is
+either deliberate exclusion prose — which is the compliance evidence and was kept — or a false
+positive (`alpha` = the FF5+MOM market-model intercept; "sharper" from §7.5's own wording;
+"spanning" as an English verb). One stale item was corrected: `clean_data` justified retaining the
+risk-free rate "for Sharpe and excess-return computation". `rf` *is* still needed — `estimate_car`
+forms excess returns as `r − rf` — so only the stated reason was a v5 artifact.
+
+### Universe conformance: correct throughout
+
+`output/full_panel_firm_sample.csv` is read by exactly one module, `build_fm_panel`. §7.2, §7.3
+and §7.6 use the full screened universe via `estimate_car.pit_screen`; §7.4 and §7.5 restrict to
+the 1,000-firm draw, with an `issubset` raise as a second guard. v6's own warning — "do not apply
+the subsample to the event study" — is honoured. TExp vintage conventions match each section:
+per-event for §7.2/§7.6, one fixed cross-section for §7.3, carried forward monthly for §7.4.
