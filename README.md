@@ -1,8 +1,15 @@
 # Dissertation
-> **Status:** this file is still a stub. `CLAUDE.md` requires it to be a full
-> reproducibility document (dependencies, credentials, WRDS source-to-field mappings,
-> end-to-end run instructions, assumptions, fallbacks, deviations). Only the EDGAR pull
-> caching/rate-limiting behaviour is documented so far.
+> **Status:** partial. `CLAUDE.md` requires this to be a full reproducibility document
+> (dependencies, credentials, WRDS source-to-field mappings, end-to-end run instructions,
+> assumptions, fallbacks, deviations). Documented so far: the EDGAR pull, the Step 2 cleaning
+> and scoring pipeline, the Step 4/6 event-study cycles, and the Step 7/8 Fama-MacBeth test and
+> its EPU regime split - each with its source mappings, assumptions and dated deviations.
+> **Every §7.x test in the research design is now implemented.**
+>
+> **Still missing, and required:** the dependency list and Python version, `.env` and WRDS
+> credential expectations, Step 1 (`clean_data.py`) source-to-field mappings for the CRSP and
+> Compustat exports, and a single end-to-end run order covering every script from
+> `clean_data.py` to `fama_macbeth_pricing.py`.
 
 ## EDGAR pull: submissions cache and rate limiting
 
@@ -275,3 +282,221 @@ definition, so `def load_panel(path=PANEL_PATH)` keeps pointing at whichever cyc
 import and silently reads the wrong panel after `select_cycle`. `load_panel`,
 `load_event_controls`, `load_factors`, `write_results` and `write_stability` all take `None` and
 resolve from the module global at call time.
+
+## Step 7: section 7.4 Fama-MacBeth pricing test (H2, H5)
+
+Two scripts, split the way `build_texp_panel.py` and `run_car_regression.py` are: assemble the
+monthly panel, then estimate. Run in order.
+
+```
+python build_fm_panel.py [--status]      # monthly firm panel, every candidate row + its reason
+python fama_macbeth_pricing.py           # 96 monthly cross-sections, Newey-West, figure, report
+```
+
+| Path | Contents |
+| --- | --- |
+| `clean_data/fm_panel.csv` | 86,009 candidate firm-months x 31 cols; `exclusion_reason` empty on the 53,745 that estimate |
+| `output/fm_lambda_panel.csv` | 192 rows - monthly lambda_1, its within-month se/t/p, lambda_FS, firm count, R2, lagged EPU, episode label, per specification |
+| `output/fm_lambda_chart.png` | the section 7.4 figure: lambda_1,t over 96 months with both tariff episodes shaded |
+| `output/fama_macbeth_validation_report.txt` | eleven sections, house style |
+
+**No existing script was modified.** Both scripts import `clean_controls_data`, `clean_data` and
+`run_car_regression` read-only and reuse their functions, so the section 7.2 and 7.6 outputs cannot
+have moved; `git status` showing only two new files is the proof, which is why no `--cycle 2025`
+re-verification was needed.
+
+### Which filings the test uses, and why it cannot read the panel own z column
+
+`texp_panel.csv` pools all **17** `edgar_pull` reference dates. This test uses the **nine** that are
+the `full_panel` batch - April 2 each year 2017-2025, pulled at scope `subsample` - intersected with
+the 1,000 PERMNOs in `output/full_panel_firm_sample.csv`. The other eight dates belong to the
+cross-cycle event study.
+
+Two of those nine, **2018-04-02 and 2025-04-02**, were *also* pulled at scope `full` for section
+7.6, so they hold 2,289 and 2,868 rows against the 560 and 958 subsample firms present. The panel
+`TExp_item1a_z` is therefore standardised over the wrong population at exactly those two vintages -
+the subsample slice has mean 0.045/0.073 and sd 1.078/1.041 rather than (0, 1), with individual z
+values moving by up to 0.70 - and those two vintages cover **20 of the 96 sample months**.
+`build_fm_panel.load_texp` recomputes the z within (reference date x subsample) and asserts mean 0
+and sd 1 per vintage to `build_texp_panel` own tolerances.
+
+Standardising at all is required rather than cosmetic. Raw `TExp_item1a` cross-sectional sd rises
+**2.7x** across the nine vintages (0.00471 in 2017 to 0.01265 in 2025) and its zero share falls from
+**72% to 16%**, so one raw unit is a 2.7x larger move in exposure in 2017 than in 2025 and a
+time-series mean of raw slopes would silently mix the two scales. Section 4 of the research design
+defines TExp standardised for the same reason. Section 8 of the report converts the section 7.2
+coefficients into the same units - multiplying by the sd of their own 2,868-firm cross-section,
+0.012149 - so the two sections stay comparable.
+
+**The full-scope rows at those two vintages never enter.** The subsample restriction is applied to
+the CRSP monthly read, so a non-subsample firm has no row for a vintage to join to, and
+`load_texp` asserts `issubset` on the vintage slice as well. At 2018-04-02 the panel holds 2,289
+rows and this test uses 550 (425 estimate); at 2025-04-02 it holds 2,868 and uses 950 (733
+estimate) - in line with the 330-728 of the other seven vintages, and the largest monthly
+cross-section anywhere is 721 firms. The 20 months those two vintages serve hold 19.6% of
+firm-months against 20.8% of months, so they are marginally *under*-represented rather than over.
+Report section 2 shows the whole-vintage row count beside the count used, so the containment is
+visible rather than asserted.
+
+Separately, cross-sections do grow from 97 firms (2018-01) to 721 (2025), because the §7.0 draw was
+taken at end-March 2025 and more of the 1,000 are listed in later years - the acknowledged cost of
+that reference date. Fama-MacBeth averages the monthly slopes with **equal weight per month**, so
+this affects how precisely each month is estimated, not how much each month counts toward
+`lambda_1_bar`. Firm-month weighting would give +0.034% against the reported +0.046%.
+
+A `y-04-02` vintage covers return months **May y through April y+1**: its newest filing is dated
+`y-04-01`, so it is public before the first month opens, and `filing_date <= pit_date` is asserted
+on every retained row. It is carried no further. Unlimited carry-forward would add 120
+firm-vintage-years (+1.7%) at the cost of scoring a month with a filing already known to be more
+than a year stale.
+
+### Point-in-time construction
+
+Every regressor is resolved at `pit_date`, the last calendar day of month *t-1*; the only month-*t*
+quantity is the dependent variable.
+
+| Variable | Source and rule |
+| --- | --- |
+| `ret` | raw `Monthly Returns.csv`, month *t*. Taken from the unscreened file so a firm screened in at *t-1* that breaks $1 during *t* still contributes the return it earned - selecting the dependent variable on the screen would be selection on the outcome |
+| `in_screen_lag` | presence in `clean_returns.csv` at *t-1*. Presence *is* the section 6 screen; reading it one month back is the `estimate_car.pit_screen` rule |
+| `me_lag`, `ln_me_lag` | `MthCap` at *t-1*, joined on the previous **calendar** month rather than by `shift`, which across a listing gap would import market equity from several months earlier |
+| `bm`, `lev` | `ccd.merge_fundamentals` as-of `pit_date` with `allow_exact_matches=False`, then `ccd.build_ratios` - the same validated `available_date` gate section 7.2 uses |
+| `mom12` | `ccd.add_momentum`, evaluated at month *t* because its window for month *j* is `[j-12, j-1]`, which is already the characteristic known at *t-1* |
+| `FS` | `foreign_sales_share.csv` on the panel own point-in-time `(gvkey, datadate)`, exactly as `run_car_regression.build_sample` joins it |
+| `ff12` | the firm own SIC at *t-1*, remapped monthly through `ccd.parse_ff12` |
+| `epu_lag` | `clean_epu.csv` at *t-1*, carried only - section 7.5 consumes it, this test does not |
+
+`clean_data.COMMON_EQUITY_FILTER` is applied to the raw monthly read so the universe definition
+matches the `clean_returns.csv` one. Without it ten firm-months carry a second CRSP row -
+`PrimaryExch` X, `SICCD` 0, null security metadata, the stub written the month a listing moves or
+ends - which repeat the return and cap exactly but would fan out every downstream merge.
+
+### Deviations, dated 2026-09-01
+
+1. **Sample is 2018-01 to 2025-12, 96 monthly cross-sections**, against the design "approximately
+   110". `Monthly Returns.csv` begins 2017-01-31 and no earlier return history exists anywhere in
+   the project, so the twelve months ending *t-1* are first complete at 2018-01; TExp is
+   independently unavailable before 2017-05. The eight months this costs are 2017-05 to 2017-12.
+   Recovering them needs a CRSP monthly export for 2016; the momentum grid is derived from the
+   file own span, so no code change would be required.
+2. **Exposure standardised within vintage**, where sections 7.2 and 7.3 use raw TExp. Reasons above.
+3. **FF12 is point-in-time and time-varying**, where `ccd.assign_ff12` fixes one label per firm from
+   a snapshot before the active cycle first event - which for cycle 2025 would apply a 2025
+   classification to a 2018 cross-section. That convention exists to hold industry effects
+   identical across the two legs of one event study; 96 independent cross-sections have no such
+   pair to protect.
+4. **Both specifications are estimated on identical rows.** The H5 variant drops FS and the industry
+   dummies from the right-hand side but not the rows requiring them, so any movement in
+   `lambda_1_bar` is the specification and not the sample. Requiring FS costs 13,752 firm-months
+   (16.0% of candidates) in both.
+5. **`MIN_FIRMS_PER_MONTH = 50`** is a degrees-of-freedom floor set from the specification 18
+   parameters, not from any month. It binds on none. Thin months are reported and carried, with a
+   stated sensitivity, rather than removed at a threshold chosen after seeing which months it hits.
+6. **PolRisk excluded**, per the constraint note at the head of section 7. **Version B** of the
+   design (Fama-MacBeth on rolling TExp-factor betas) is not run; v6 drops it with the long-short
+   portfolio it depended on.
+
+### Known limitation: two thin months in early 2018
+
+`Compustat Geographic segment data.csv` begins at datadate 2017-01-31, so firms still reporting
+FY2016 fundamentals in early 2018 have no segment row and drop on the FS control - the same gap
+recorded above for the two earliest cross-cycle events. Cross-sections are **97 firms at 2018-01
+and 106 at 2018-02**, against 240 by March, 402 by May and 685-721 through 2025. Those two months
+are also selected toward early filers, which is a composition caveat and not only a precision one.
+The report gives `lambda_1_bar` with and without them; nothing is imputed.
+
+### How to read the outputs
+
+`lambda_1_bar = +0.046%` per month per standard deviation of exposure, Newey-West 6-lag t = 0.95,
+p = 0.344 - **weak and insignificant, which is what the design predicted in advance and must not be
+written up as a refutation of H1**. H5: the slope moves from +0.065% to +0.046% when FS and the
+industry effects enter, keeping its sign, though neither estimate is distinguishable from zero, so
+that reads as consistency rather than as a passed test.
+
+The figure is the nominated output of the section, and it does **not** show the pattern the design
+hoped for. The largest monthly slopes tilt toward the episodes - 5 of the 10 largest against 2.9
+expected by chance, hypergeometric tail 0.124 - but the tilt is not distinguishable from chance, the
+single largest month of all (2022-11, +1.69%) falls outside both episodes, and the dispersion of
+`lambda_1,t` inside the episodes is barely above the dispersion outside. The episodic reading
+therefore rests mainly on the section 7.2 event-window coefficients and their distance from this
+mean, with the monthly series offering weak corroboration rather than independent support. Per
+section 5.2 item 6, subsample noise cannot be separated from a genuine absence of unconditional
+pricing, and this null must not be presented as evidence of no effect.
+
+### §7.5 EPU regime conditioning (H3)
+
+Sections 10-12 of the same validation report, produced by the same run. Not a second estimation: a
+post-hoc classification of the 96 monthly lambda_1,t values, so no cross-section is re-fitted and
+`fm_lambda_panel.csv` is byte-identical either side of the addition.
+
+| Path | Contents |
+| --- | --- |
+| `output/fm_epu_regime_results.csv` | 12 rows - 3 tau x 2 regimes, plus 3 episode splits x 2. One row per (split, tau, regime), with the pair's test statistics on both rows so a single row is self-describing |
+| `output/fama_macbeth_validation_report.txt` | gains sections 10 (EPU split), 11 (episode split beside it), 12 (bucket composition); the old 10 and 11 renumbered 13 and 14 |
+
+**tau.** The percentile of the EPU series over **2017-01 to 2026-05** (113 months - the series ends
+May 2026), per §7.5: a property of the uncertainty environment, not of this test's sample window.
+`numpy.percentile` with its default linear interpolation, named because another quantile convention
+moves tau and with it the borderline months. p50 = 175.87, p75 = 252.59 (§7.5's primary),
+p90 = 371.25, giving 48/48, 22/74 and 9/87 high/low months across the 96 estimated. Computed on the
+96 estimated months instead, tau would be 176.04 / 231.13 / 350.11 - reported as a contrast, not
+used. Fixed before estimation; nothing searches over thresholds.
+
+**The lag was applied upstream.** `build_fm_panel` attached EPU of *t-1* to month *t*, so §7.5
+asserts that the panel's `epu_lag` equals a fresh one-month lag of the series rather than
+re-deriving it - a second implementation here would be one more thing able to disagree with the
+panel it classifies. No boundary loss: the first sample month, 2018-01, takes 2017-12.
+
+**One function, two conditioning variables.** `regime_split` is generic over any boolean indicator,
+so the three EPU splits and the three episode splits carry identical statistics from identical code.
+That is what makes §7.5's "the episode-based split should be sharper than the EPU-based one" a
+comparison rather than two tables side by side. Each per-episode split compares that episode's
+months against the months outside **both**, so 2018-19 is not contaminated by 2025 or the reverse.
+
+**Two difference tests, deliberately.** **Welch** is the nominated test and the headline. It treats
+the monthly slopes within a regime as independent draws, which they are not - which is why each
+regime mean carries a Newey-West error - so a **HAC difference** is reported beside it:
+`lambda_t = a + b*1{high} + e` with NW 6 lags, the same correction the levels carry. The point
+estimates are identical by construction (a dummy regression's slope *is* the difference in means,
+asserted); only the errors differ.
+
+**Small-regime caveat.** `MIN_REGIME_MONTHS_FOR_HAC = 4 x NW_LAGS = 24`, set from the lag length and
+not from which regimes it catches. Below it a Newey-West error at 6 lags is unreliable: the p90 high
+bucket holds 9 months and returns se = 0.00134 against an iid 0.00247, and a HAC SE *below* the iid
+SE is a finite-sample artefact. statsmodels raises nothing, so the flag is the only thing that
+surfaces it. Four of the twelve rows carry it (p75 high 22 months, p90 high 9, 2018-19 23, 2025 5);
+none is suppressed, and the iid error is printed alongside.
+
+#### How to read the outputs
+
+**H3 is not supported at the nominated p75 threshold.** High-EPU lambda_bar = +0.169% per s.d.
+against +0.010% low; difference +0.159%, Welch p = 0.305, HAC p = 0.234. One of H3's limbs holds
+(|lambda_bar| is larger in the high regime), the other does not.
+
+**The thresholds run backwards.** The difference is +0.224% at p50 (HAC p = 0.021), +0.159% at p75
+(p = 0.234), +0.020% at p90 (p = 0.876) - falling monotonically as the threshold rises, where a
+premium tracking uncertainty intensity would rise. Either only the median split has both buckets
+large enough to detect anything (a power pattern, not a mechanism), or the higher buckets are
+diluted by their content; every sub-bucket the second reading rests on is below the HAC floor, so
+the panel cannot settle it. **The median split is significant and must not become the headline** -
+promoting it over the pre-nominated p75 would be choosing the threshold on the result, which is
+exactly what fixing tau in advance prevents. Report it as the robustness line §7.5 asked for.
+
+**The high-EPU bucket is not a tariff bucket** - the §7.5-mandated disclosure. At p75 its 22 months
+are 8 from COVID-2020, 2 from early 2021, 10 from 2025, and **2 from the whole 2018-19 trade war**;
+at p90 the trade war contributes **none**. News-based EPU in 2018-19 was not extreme by 2017-2026
+standards, dwarfed by COVID and 2025. A premium here is therefore about elevated policy uncertainty
+in general, not about tariff salience.
+
+**It is not a COVID artefact.** Dropping the 2020 months makes the high-regime mean *larger* at
+every threshold - p50 0.159% to 0.195%, p75 0.169% to 0.322%, p90 0.065% to 0.157% - so on the point
+estimates COVID months were diluting the premium rather than producing it. The accompanying
+t-statistics are not evidence: those buckets hold 37, 14 and 5 months, two below the floor.
+
+**The episode split is the weaker conditioning variable, not the sharper one**, contrary to §7.5's
+expectation. Every EPU split above p90 separates the slopes more sharply, and no episode split
+approaches significance (binary p = 0.474, 2018-19 p = 0.310, 2025 p = 0.513). Each span runs from
+its cycle's first event to its last, so it holds both the tightening and loosening legs and its mean
+nets a predicted-negative month against a predicted-positive one; and both episodes sit under the
+HAC floor at 23 and 5 months. Its null is not evidence that tariff salience does not matter - §7.2,
+where the legs are separated and the window is days rather than months, is where that is answered.
