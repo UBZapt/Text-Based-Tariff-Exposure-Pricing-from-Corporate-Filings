@@ -144,3 +144,134 @@ regexes were tuned on 2024-vintage documents and pre-2020 filings largely predat
 so the research design requires this rate be reported per vintage; a materially worse early
 vintage is a finding for the write-up, not something to patch away silently. Baseline is 97.1%
 on the 2025 corpus.
+
+## Step 4/6 event study: the `--cycle` switch and the two policy cycles
+
+The three event-study scripts run against either policy cycle, selected by one flag. `2025` is the
+default and reproduces every pre-existing output; `cross_cycle` is the section 7.6 out-of-sample
+leg. Run them in order:
+
+```
+python clean_controls_data.py [--cycle 2025|cross_cycle]   # controls panel
+python estimate_car.py        [--cycle 2025|cross_cycle]   # FF5+MOM loadings, ARs, CARs
+python run_car_regression.py  [--cycle 2025|cross_cycle]   # cross-sectional regressions
+```
+
+Cycle configuration lives in one place, `clean_controls_data.CYCLES`, shaped like
+`edgar_pull.SCOPES`/`BATCHES`. Scripts 2 and 3 import it rather than re-declaring dates or paths,
+and each has a `select_cycle()` that rebinds its own cycle-dependent constants off it.
+
+| | `2025` (section 7.2) | `cross_cycle` (section 7.6) |
+| --- | --- | --- |
+| events | impose 2025-04-02, reverse 2025-08-29 | 7 Section 301 escalations 2018-03-01 … 2019-08-23, plus de-escalations 2019-10-11 (primary) and 2020-01-15 (Phase One, robustness) |
+| daily returns | `Daily returns.csv` | `CRSP Daily returns cross cycle.csv` + `CRSp Daily returns cross cycle pt2.csv` |
+| factors | `Fama French daily.csv` | `FF5+MOM daily Cross cycle.csv` + `FF5 + MOM daily cross cycle pt2.csv` |
+| estimation window | per-run policy anchors (−51, −34, −66 trading days) | uniform `[-252, -11]`, all nine runs |
+| outputs | unsuffixed | suffixed `_cross_cycle` |
+
+Escalation dates are Bruno, Goltz & Luyten (2024, *European Financial Management*) Table 3, used
+exactly as published; taking their event list removes the discretion in date selection and makes
+the comparison to their results direct.
+
+### Merging the two-part daily exports
+
+Where a cycle lists more than one returns or factor file they are concatenated and reconciled by
+the code that already handles CRSP's own repeated rows — no separate merge step. `dedupe_daily`
+drops exact duplicate rows and **raises** on a `(permno, date)` pair carrying differing values;
+`estimate_car.load_factors` does the same on `date`. The 2017 extensions overlap the originals by
+61 trading days, and that overlap is byte-identical (174,902 CRSP rows across 2,903 PERMNOs, zero
+differences on any field; zero disagreement on any FF factor), so the merge is silent. A future
+re-pull that disagreed would fail loudly instead of being resolved by read order.
+
+### Which 10-K each event uses
+
+TExp is read from `clean_data/texp_panel.csv`, **sliced to each event's `edgar_pull` reference
+date**, never from `tariff_scores.csv`. Since Step 2 was rescaled across 17 reference dates the
+scores table holds one row per `(permno, accession)` — 13,380 rows over 3,762 firms — so a
+permno-keyed read of it is ambiguous and the vintage a score belongs to is not recoverable from it.
+`texp_panel.csv` carries `reference_date` and is unique on `(permno, reference_date)`.
+
+`decile_sort.py` takes a single vintage this way — 2025-04-02, since §7.3 fixes breakpoints on one
+cross-section and holds group membership constant across both legs. `foreign_sales.py` takes the
+same vintage: the project reports **one** TExp–FS correlation, measured on the 2025 event's
+cross-section (§7.1), because that is the sample the event study uses. It joins on
+`(permno, fiscal_year)` rather than permno, so the rescale had not made it fail — it had silently
+widened the correlation sample from 2,110 firm-years to 9,383 across FY2017–FY2025. Restricting it
+restored every reported figure exactly: headline Pearson r = 0.2865, Spearman 0.3801, n = 2,110,
+and `foreign_sales_share.csv` byte-identical.
+
+Restricting it also surfaced a latent bug: `build_texp_panel.attach_scores` never selected
+`fiscal_year` from the scores table, so `texp_panel.csv` declared the column and left it null in
+all 29,474 rows. Inert where the column was only carried along, fatal to a join keyed on it. Fixed
+at source; the rebuilt panel is identical on every TExp and staleness value.
+
+Cross-cycle event dates and pull reference dates coincide by construction, so event `2018-03-01`
+uses the 10-K selected at reference date `2018-03-01` — filed inside `[ref−364, ref−1]`, strictly
+before the event, no look-ahead. Both 2025 legs share the single `2025-04-02` vintage, because H1
+requires exposure held fixed across the imposition and reversal legs and there is no 2025-08-29
+pull. `load_texp_reasons` is sliced the same way, against `output/texp_panel_diagnostics.csv` and
+the reference-date slice of `edgar_pull_log.csv`.
+
+### The H4 stability test
+
+Run with a non-baseline cycle, Script 3 re-estimates the baseline cycle and fits
+
+```
+CAR = a + b*TExp + B*cc + d*(TExp x cc) + c*FS + gamma'X + FF12 dummies + e     H0: d = 0
+```
+
+on the per-event primary estimation samples themselves, so every section 7.2 exclusion already
+applies and the pooled test cannot admit a firm the per-event regressions dropped. Reported
+pooled per leg (tightening: 2025 imposition against all seven escalations; loosening: 2025 reversal
+against the primary de-escalation) and pairwise, one cross-cycle date at a time, at each of the
+three event windows. Output: `output/stability_test_results_cross_cycle.csv` and section 10b of the
+regression report.
+
+### Deviations, dated 2026-09-01
+
+1. **Estimation window `[-252, -11]` for the cross cycle**, in place of per-run policy anchors.
+   Nine events admit no defensible per-event anchor — the Section 301 process ran continuously from
+   January 2018, so every candidate date sits inside the repricing it is meant to exclude, and
+   choosing nine would reintroduce the date discretion section 7.6 rules out. `-11` is the latest
+   uniform close leaving the widest event window `[-10,+10]` free of its own estimation window; all
+   nine resolve to a full 242 days with zero own-event overlap, asserted in the report.
+
+2. **Standard errors clustered on permno, on the pooled stability test only.** Stacking two cycles
+   puts each firm in the sample once per event, so the per-event independence assumption does not
+   carry over. All 27 per-event cross-cycle regressions keep `COV_TYPE = "nonrobust"`, identical to
+   the section 7.2 run. Section 7.2 still nominates White HC for the reported table; that remains
+   outstanding on both cycles.
+
+3. **Controls and FF12 effects constrained equal across cycles** in the pooled regression; only
+   TExp is interacted, per section 7.6's "a cycle interaction". A fully interacted model is a
+   different and much weaker test.
+
+4. **`estimate_car._check_contamination` no longer raises on cross-event overlap**, only on
+   own-event overlap and on a non-contiguous window. With nine dates 6 to 162 trading days apart a
+   later run's estimation window routinely spans earlier events — as the 2025 reversal window
+   deliberately contains the imposition — and two overlaps are partial. Contiguity is what proves a
+   window unmodified; partial overlap means only that its boundary fell inside a neighbouring
+   event. Overlaps are now reported full/partial/none rather than failing the run.
+
+5. **PolRisk is not included** in the cross-cycle specification, though the Hassan series covers
+   2017-2020 and section 7.6 nominates it. Adding a control absent from the 2025 specification
+   would break the specification identity the out-of-sample claim rests on. Descoped by
+   instruction, along with the lexicon/BEA-Census stability check.
+
+### Known limitation: foreign-sales coverage at the two earliest events
+
+`Compustat Geographic segment data.csv` begins at datadate 2017-01-31, so firms still reporting
+FY2016 fundamentals in early 2018 have no segment row and drop out on the FS control. FS matches
+**1,185 firms at 2018-03-01 and 1,759 at 2018-03-22, against 2,093–2,157 at every later
+cross-cycle date and 2,893 at 2025-04-02**; regression *n* at 2018-03-01 is 917 against 1,242–1,431
+elsewhere. Nothing is imputed — absence from the segment file is not evidence of a domestic-only
+firm — so the effect is a thinner cross-section at those two dates, reported rather than absorbed.
+Re-pulling segments back to FY2015 would close it.
+
+### Standing implementation trap
+
+**Never bind a cycle-dependent path as a default argument.** Python evaluates defaults once, at
+definition, so `def load_panel(path=PANEL_PATH)` keeps pointing at whichever cycle was active on
+import and silently reads the wrong panel after `select_cycle`. `load_panel`,
+`load_event_controls`, `load_factors`, `write_results` and `write_stability` all take `None` and
+resolve from the module global at call time.

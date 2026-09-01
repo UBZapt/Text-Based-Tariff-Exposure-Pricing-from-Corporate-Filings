@@ -1,18 +1,20 @@
 """
-Step 4c - Script 2 of 3: daily abnormal returns and CARs for both 2025 tariff events.
+Step 4c - Script 2 of 3: daily abnormal returns and CARs for one policy cycle's events.
 
 Estimates FF5+MOM market-model loadings per firm over an event-specific estimation window and
 cumulates daily abnormal returns into CARs over [-1,+1], [-5,+5] and [-10,+10].
 
-    impose  = 2025-04-02  (Liberation Day)
-    reverse = 2025-08-29  (Federal Circuit, V.O.S. Selections v. Trump)
+    --cycle 2025          3 runs: 2 imposition windows (2025-04-02) + the reversal (2025-08-29)
+    --cycle cross_cycle   9 runs, one per Section 301 event date, 2018-03-01 .. 2020-01-15
 
-Three runs are estimated independently, with no betas reused across events or across the two
+Runs are estimated independently, with no betas reused across events or across the two 2025
 imposition windows. No cross-sectional regression on TExp - that is Script 3.
 
-    python estimate_car.py
+    python estimate_car.py                    # 2025, the default
+    python estimate_car.py --cycle cross_cycle
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -26,11 +28,11 @@ import clean_controls_data as ccd
 BASE = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE / "output"
 
-# The panel path and the two event dates are owned by Script 1, which writes them; importing
-# rather than re-declaring keeps one definition (the precedent score_filings.py set for
-# clean_filings.py in Step 4b).
+# The panel path, the event dates and the cycle registry are owned by Script 1, which writes them;
+# importing rather than re-declaring keeps one definition (the precedent score_filings.py set for
+# clean_filings.py in Step 4b). These three are rebound by select_cycle().
 PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
-FF_DAILY_FILE = BASE / "Fama French daily.csv"
+FF_DAILY_FILES = ccd.CYCLES[ccd.DEFAULT_CYCLE]["ff_daily"]
 REPORT_OUT = OUTPUT_DIR / "car_estimation_validation_report.txt"
 
 PANEL_COLUMNS = ["permno", "ticker", "date", "ret", "in_screened_universe"]
@@ -63,7 +65,7 @@ IN_SAMPLE_AR_TOL = 1e-10  # OLS residuals sum to zero; this is a machine-precisi
 # Each run pairs an event with the date its estimation window must close before. The anchors are
 # policy dates supplied by the research design and are not necessarily trading days, so the window
 # ends on the last trading day strictly before the anchor.
-RUNS = [
+RUNS_2025 = [
     {
         "name": "imposition_primary",
         "event": "impose",
@@ -97,6 +99,59 @@ RUNS = [
                        "first judicial reversal signal; imposition event deliberately retained",
     },
 ]
+
+RUNS = RUNS_2025
+
+
+def build_runs(cycle_name: str) -> list[dict]:
+    """The runs to estimate for one cycle: the 2025 anchor-dated three, or one per event.
+
+    Where the cycle carries an ``anchor_offset`` the estimation window closes a fixed number of
+    trading days before each event rather than before a hand-picked policy date. Nine Section 301
+    events admit no such date - the escalation process ran continuously from January 2018, so any
+    anchor sits inside the repricing it is meant to exclude - and inventing nine would reintroduce
+    exactly the date discretion section 7.6 rules out.
+    """
+    cycle = ccd.CYCLES[cycle_name]
+    if cycle["anchor_offset"] is None:
+        return RUNS_2025
+    offset = cycle["anchor_offset"]
+    widest = min(lo for lo, _ in EVENT_WINDOWS)
+    if offset > widest:
+        raise ValueError(f"anchor_offset {offset} closes the estimation window inside the widest "
+                         f"event window [{widest}, ...]; the event's own abnormal returns would "
+                         f"be in-sample OLS residuals.")
+    return [{
+        "name": name,
+        "event": name,
+        "anchor_offset": offset,
+        "out": OUTPUT_DIR / f"car_cc_{name}.csv",
+        "anchor_note": f"uniform rule: window closes {abs(offset)} trading days before the event, "
+                       f"the last day before the widest event window [{widest},+{-widest}] opens",
+    } for name in cycle["events"]]
+
+
+def select_cycle(name: str) -> dict:
+    """Rebind this module's cycle-dependent paths and runs, and Script 1's alongside them."""
+    global PANEL_PATH, FF_DAILY_FILES, REPORT_OUT, RUNS
+    cycle = ccd.select_cycle(name)
+    PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
+    FF_DAILY_FILES = cycle["ff_daily"]
+    REPORT_OUT = OUTPUT_DIR / f"car_estimation_validation_report{cycle['suffix']}.txt"
+    RUNS = build_runs(name)
+    return cycle
+
+
+def sign_flip_pair(results: dict) -> tuple[tuple[str, pd.DataFrame], ...] | None:
+    """The cycle's named (tightening, loosening) runs, as (name, frame) pairs.
+
+    Named in ccd.CYCLES rather than inferred from run names, so which two legs carry the sign-flip
+    test is a recorded decision and not an artefact of a string suffix.
+    """
+    names = ccd.CYCLES[ccd.CYCLE]["sign_flip_pair"]
+    if not set(names) <= set(results):
+        return None
+    return tuple((name, results[name][0]) for name in names)
 
 
 def _window_label(lo: int, hi: int) -> str:
@@ -155,13 +210,18 @@ def _describe(frame: pd.DataFrame, cols: list[str], width: int = 18) -> None:
 # --------------------------------------------------------------------------- #
 # Inputs                                                                      #
 # --------------------------------------------------------------------------- #
-def load_panel(path: Path = PANEL_PATH) -> pd.DataFrame:
+def load_panel(path: Path | None = None) -> pd.DataFrame:
     """Read the five columns of Script 1's panel this script needs.
 
     in_screened_universe is coerced explicitly rather than trusted to pandas' inference: CSV does
     not carry dtypes, and a bool column silently arriving as object would make the point-in-time
     screen flag meaningless. Same class of hazard as the cik zero-padding closed in Step 4b.
+
+    The path defaults to None and is resolved from the module global at call time, never bound as
+    a default argument: Python evaluates defaults once at definition, so a default of PANEL_PATH
+    would keep pointing at the cycle that was active on import and silently read the wrong panel.
     """
+    path = PANEL_PATH if path is None else path
     if not path.exists():
         raise FileNotFoundError(f"{path.name} not found; run clean_controls_data.py first.")
     if ccd.OUTPUT_FORMAT != "csv":
@@ -175,15 +235,32 @@ def load_panel(path: Path = PANEL_PATH) -> pd.DataFrame:
     return panel
 
 
-def load_factors(path: Path = FF_DAILY_FILE) -> pd.DataFrame:
-    """Read the daily FF5+MOM factor file and the risk-free rate."""
-    if not path.exists():
-        raise FileNotFoundError(f"{path.name} not found; it is a required input.")
-    ff = pd.read_csv(path, parse_dates=["date"])
-    missing = [c for c in ["date", "rf"] + FACTORS if c not in ff.columns]
-    if missing:
-        raise ValueError(f"{path.name} is missing required field(s): {missing}")
-    return ff[["date", "rf"] + FACTORS].sort_values("date").reset_index(drop=True)
+def load_factors(paths: list[Path] | None = None) -> pd.DataFrame:
+    """Read the daily FF5+MOM factor files and the risk-free rate.
+
+    Where a cycle supplies more than one export they are concatenated, exact duplicate rows
+    dropped, and the date index then asserted unique - so an overlap that agrees is merged
+    silently while one that disagrees raises rather than being resolved by read order. Same
+    contract as clean_controls_data.dedupe_daily applies to the returns files.
+    """
+    paths = FF_DAILY_FILES if paths is None else paths
+    frames = []
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"{path.name} not found; it is a required input.")
+        ff = pd.read_csv(path, parse_dates=["date"])
+        missing = [c for c in ["date", "rf"] + FACTORS if c not in ff.columns]
+        if missing:
+            raise ValueError(f"{path.name} is missing required field(s): {missing}")
+        frames.append(ff[["date", "rf"] + FACTORS])
+
+    out = pd.concat(frames, ignore_index=True).drop_duplicates()
+    conflicting = out.loc[out["date"].duplicated(keep=False), "date"].unique()
+    if len(conflicting):
+        raise ValueError(f"{len(conflicting)} date(s) carry differing factor values across "
+                         f"{', '.join(p.name for p in paths)}: "
+                         f"{_listed(pd.DatetimeIndex(conflicting).strftime('%Y-%m-%d'))}")
+    return out.sort_values("date").reset_index(drop=True)
 
 
 def build_calendar(panel: pd.DataFrame) -> pd.DatetimeIndex:
@@ -222,20 +299,35 @@ def reconcile_calendar(cal: pd.DatetimeIndex,
 def resolve_run(run: dict, cal: pd.DatetimeIndex) -> dict:
     """Resolve one run's event date, anchor and offsets onto the working trading calendar.
 
-    The anchor is a policy date and need not be a trading day (2025-01-20 is MLK Day), so the
-    estimation window closes on the last trading day *strictly before* it - a calendar
-    ``anchor - 1 day`` would land on a Sunday for that anchor. Returns integer indices alongside
-    the calendar dates they resolve to so the report can show both.
+    Two ways to close the estimation window, and both end on the last trading day strictly before
+    an anchor - only the anchor's provenance differs:
+
+    ``anchor``        a policy date, which need not be a trading day (2025-01-20 is MLK Day), so a
+                      calendar ``anchor - 1 day`` would land on a Sunday. Used by the 2025 runs.
+    ``anchor_offset`` a fixed count of trading days before the event, used where a cycle has too
+                      many events to anchor each on a defensible policy date. The equivalent
+                      anchor date is derived back out for the report, so both paths document the
+                      window the same way.
+
+    Returns integer indices alongside the calendar dates they resolve to so the report can show
+    both.
     """
     event_date = pd.Timestamp(ccd.EVENT_DATES[run["event"]])
-    anchor = pd.Timestamp(run["anchor"])
     if event_date not in cal:
         raise ValueError(f"{run['name']}: event date {event_date:%Y-%m-%d} is not a trading day "
                          f"in the working calendar.")
 
     event_idx = int(cal.get_loc(event_date))
     est_lo = event_idx + EST_START_OFFSET
-    est_hi = int(cal.searchsorted(anchor)) - 1      # last trading day strictly before the anchor
+    if "anchor_offset" in run:
+        est_hi = event_idx + run["anchor_offset"]
+        if not 0 <= est_hi < len(cal) - 1:
+            raise ValueError(f"{run['name']}: anchor offset {run['anchor_offset']} resolves off "
+                             f"the calendar (index {est_hi} of {len(cal)}).")
+        anchor = cal[est_hi + 1]        # the window closes strictly before this day, as above
+    else:
+        anchor = pd.Timestamp(run["anchor"])
+        est_hi = int(cal.searchsorted(anchor)) - 1  # last trading day strictly before the anchor
 
     if est_lo < 0:
         raise ValueError(f"{run['name']}: estimation window opens {-est_lo} trading days before "
@@ -492,31 +584,33 @@ def _check_contamination(results: dict, cal: pd.DatetimeIndex) -> None:
         r = stats["resolved"]
         event_windows[r["event"]] = cal[r["event_idx"] + widest_lo:r["event_idx"] + widest_hi + 1]
 
+    # Own-event overlap is the only fatal case: it would make a run's own abnormal returns
+    # in-sample OLS residuals, mechanically pulled toward zero. Overlap with *another* event's
+    # window is reported, not raised. Across nine Section 301 dates it is the norm - the events sit
+    # 6 to 162 trading days apart, so a later run's estimation window routinely spans earlier ones,
+    # exactly as the 2025 reversal window deliberately contains the imposition. Contiguity, checked
+    # above, is what proves such a window is unmodified rather than excised; a partial overlap
+    # means only that the window boundary fell inside a neighbouring event, not that days were
+    # removed from it.
     _say()
+    _say(f"  own-event overlap must be 0 (asserted); other events' [{widest_lo},+{widest_hi}] "
+         f"windows are reported, not excised:")
     for name, (_, stats) in results.items():
         r = stats["resolved"]
         used = set(cal[r["est_lo"]:r["est_hi"] + 1])
+        if used & set(event_windows[r["event"]]):
+            raise ValueError(f"{name}: own event window overlaps its estimation window")
+
+        held = []
         for event, window in event_windows.items():
-            overlap = used & set(window)
             if event == r["event"]:
-                if overlap:
-                    raise ValueError(f"{name}: own event window overlaps its estimation window")
                 continue
-            # The other event's window: for the imposition runs this must be empty (they close
-            # long before the reversal); for the reversal run it must be complete and unmodified.
-            if r["event"] == "reverse" and event == "impose":
-                if not set(window).issubset(used):
-                    raise ValueError(f"{name}: the imposition event window "
-                                     f"[{widest_lo},+{widest_hi}] is not wholly present in the "
-                                     f"reversal estimation window")
-                _say(f"  {name:<22} contains the full imposition [{widest_lo},+{widest_hi}] "
-                     f"window {window[0]:%Y-%m-%d}..{window[-1]:%Y-%m-%d} "
-                     f"({len(overlap)}/{len(window)} days, unmodified) - retained by design")
-            else:
-                if overlap:
-                    raise ValueError(f"{name}: estimation window contains {len(overlap)} dates "
-                                     f"from the {event} event window")
-                _say(f"  {name:<22} holds 0 of the {len(window)} {event} event-window dates")
+            overlap = len(used & set(window))
+            if overlap:
+                held.append(f"{event} {overlap}/{len(window)}"
+                            f"{' FULL' if overlap == len(window) else ' part'}")
+        _say(f"  {name:<22} own 0/{len(event_windows[r['event']])}  |  "
+             + (", ".join(held) if held else "no other event-window days"))
 
 
 def _check_spot(results: dict, cal: pd.DatetimeIndex) -> None:
@@ -561,16 +655,18 @@ def validate(results: dict, cal: pd.DatetimeIndex, cal_stats: dict,
     _say("=" * 78)
     _say("SECTION 7.2 EVENT STUDY - CAR ESTIMATION VALIDATION REPORT")
     _say("=" * 78)
+    _say(f"Cycle         : {ccd.CYCLE}")
     _say("Events        : " + ", ".join(f"{k}={v}" for k, v in ccd.EVENT_DATES.items()))
     _say(f"Runs          : {', '.join(results)}")
     _say(f"Model         : (r - rf) = alpha + b'[{', '.join(FACTORS)}] + e, "
          f"estimation offset {EST_START_OFFSET}, min {MIN_EST_OBS} obs")
-    _say(f"Inputs        : {PANEL_PATH.name}, {FF_DAILY_FILE.name}")
+    _say(f"Inputs        : {PANEL_PATH.name}, "
+         f"{', '.join(p.name for p in FF_DAILY_FILES)}")
 
     _section("1. Trading-day sequence and factor-calendar reconciliation")
     _say(f"  reference sequence from {PANEL_PATH.name}   {cal_stats['panel_days']:>5,} days "
          f"{cal[0]:%Y-%m-%d} .. {cal[-1]:%Y-%m-%d}")
-    _say(f"  {FF_DAILY_FILE.name} rows                {cal_stats['factor_rows']:>5,} "
+    _say(f"  factor rows ({len(FF_DAILY_FILES)} file(s), merged)  {cal_stats['factor_rows']:>5,} "
          f"{cal_stats['factor_span'][0]:%Y-%m-%d} .. {cal_stats['factor_span'][1]:%Y-%m-%d}")
     _say(f"  working calendar after inner join on date  {cal_stats['working_days']:>5,} days")
     _say(f"  panel dates with no factor row (dropped)   {len(cal_stats['panel_only']):>5,}"
@@ -682,19 +778,18 @@ def validate(results: dict, cal: pd.DatetimeIndex, cal_stats: dict,
             _say(f"    {len(s['trading_no_pit_row'])} firms trade on the event date with no row "
                  f"in {s['month']} -> flagged False: {_listed(s['trading_no_pit_row'])}")
 
-    _section("8. Firm coverage overlap between the events")
-    primary = {stats["resolved"]["event"]: frame
-               for name, (frame, stats) in results.items() if name.endswith("_primary")}
-    if {"impose", "reverse"} <= set(primary):
-        imp, rev = primary["impose"], primary["reverse"]
-        _say(f"  {'window':<14}{'both':>10}{'impose only':>14}{'reverse only':>14}")
+    _section("8. Firm coverage overlap between the two legs")
+    pair = sign_flip_pair(results)
+    if pair:
+        (name_a, frame_a), (name_b, frame_b) = pair
+        _say(f"  {'window':<14}{'both':>10}{'tighten only':>14}{'loosen only':>14}")
         for lo, hi in EVENT_WINDOWS:
             col = f"car_{_window_label(lo, hi)}"
-            a = set(imp.loc[imp[col].notna(), "permno"])
-            b = set(rev.loc[rev[col].notna(), "permno"])
+            a = set(frame_a.loc[frame_a[col].notna(), "permno"])
+            b = set(frame_b.loc[frame_b[col].notna(), "permno"])
             _say(f"  {f'[{lo},+{hi}]':<14}{len(a & b):>10,}{len(a - b):>14,}{len(b - a):>14,}")
-        _say("  (imposition_primary vs reversal_primary; the joint sign-flip test in Script 3 "
-             "runs on the intersection.)")
+        _say(f"  ({name_a} vs {name_b}; the joint sign-flip test in Script 3 runs on the "
+             f"intersection.)")
 
     _check_spot(results, cal)
 
@@ -710,7 +805,8 @@ def validate(results: dict, cal: pd.DatetimeIndex, cal_stats: dict,
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
-def main() -> dict:
+def main(cycle: str = ccd.DEFAULT_CYCLE) -> dict:
+    select_cycle(cycle)
     panel = load_panel()
     factors = load_factors()
 
@@ -739,4 +835,7 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="FF5+MOM abnormal returns and CARs.")
+    ap.add_argument("--cycle", choices=sorted(ccd.CYCLES), default=ccd.DEFAULT_CYCLE,
+                    help="policy cycle to estimate (default: %(default)s)")
+    main(ap.parse_args().cycle)

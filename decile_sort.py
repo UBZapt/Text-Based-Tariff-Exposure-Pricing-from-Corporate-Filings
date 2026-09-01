@@ -54,7 +54,7 @@ OUTPUT_DIR = BASE / "output"
 # The panel path, event dates, runs, windows and CAR reader are owned by Scripts 1 and 2;
 # importing rather than re-declaring keeps one definition, as run_car_regression.py does.
 PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
-SCORES_CSV = CLEAN_DIR / "tariff_scores.csv"
+TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
 
 RESULTS_OUT = OUTPUT_DIR / "decile_sort_results.csv"
 CHART_OUT = OUTPUT_DIR / "decile_sort_chart.png"
@@ -78,6 +78,14 @@ WEIGHT_COLUMN = "me_lag"         # market equity lagged one trading day, on the 
 # The run whose point-in-time screen defines the group universe. Section 7.0 and 7.3 both name
 # end-March 2025, which is the screen estimate_car.pit_screen evaluates for the imposition legs.
 UNIVERSE_RUN = "imposition_primary"
+
+# The exposure vintage the groups are built on: the reference date whose 10-K supplies TExp for
+# that run's event. Derived from the cycle registry rather than written out, so it follows if the
+# registry changes. Section 7.3 needs exactly one cross-section - breakpoints are computed once and
+# membership held fixed across all three runs - unlike run_car_regression.py, which reads a
+# different vintage per event on the cross cycle.
+UNIVERSE_EVENT = next(r["event"] for r in ec.RUNS_2025 if r["name"] == UNIVERSE_RUN)
+TEXP_REFERENCE_DATE = ccd.CYCLES[ccd.DEFAULT_CYCLE]["texp_ref"][UNIVERSE_EVENT]
 
 ZERO_GROUP = 0                   # the TExp == 0 mass point, kept out of the quantile sort
 N_POSITIVE_GROUPS = 9            # groups 1..9 over the strictly positive remainder
@@ -151,13 +159,26 @@ def load_cars() -> dict[str, pd.DataFrame]:
     return {run["name"]: ec.read_car(run["out"]) for run in ec.RUNS}
 
 
-def load_texp(path: Path = SCORES_CSV) -> pd.Series:
-    """Tariff exposure by firm, indexed on permno."""
+def load_texp(path: Path | None = None, reference_date: str = TEXP_REFERENCE_DATE) -> pd.Series:
+    """Tariff exposure by firm at one reference date, indexed on permno.
+
+    Read from texp_panel.csv, not tariff_scores.csv. Since the Step 2 rescale the scores table is
+    one row per (permno, accession) across 17 reference dates, so permno is no longer a key there
+    and which vintage a score belongs to is not recoverable from it. The panel carries
+    reference_date and is unique on (permno, reference_date); one slice is taken here and reused
+    for every run, which is what fixes group membership across the two legs.
+    """
+    path = TEXP_PANEL_CSV if path is None else path
     if not path.exists():
-        raise FileNotFoundError(f"{path.name} not found; run score_filings.py first.")
-    frame = pd.read_csv(path, usecols=["permno", TEXP_COLUMN])
+        raise FileNotFoundError(f"{path.name} not found; run build_texp_panel.py first.")
+    panel = pd.read_csv(path, usecols=["permno", "reference_date", TEXP_COLUMN])
+    frame = panel[panel["reference_date"] == reference_date]
+    if frame.empty:
+        raise ValueError(f"{path.name} holds no cross-section at {reference_date}; available: "
+                         f"{', '.join(sorted(panel['reference_date'].unique()))}")
     if frame["permno"].duplicated().any():
-        raise ValueError(f"{path.name} is not unique on permno; the merge would fan out rows")
+        raise ValueError(f"the {reference_date} cross-section is not unique on permno; "
+                         f"the merge would fan out rows")
     return frame.set_index("permno")[TEXP_COLUMN]
 
 
@@ -473,7 +494,9 @@ def validate(results: pd.DataFrame, groups: pd.Series, universe: pd.DataFrame,
          f"{len(ec.RUNS) * len(ec.CAR_COLUMNS) * len(GROUPS)} cells)")
     _say("Events        : " + ", ".join(f"{k}={v}" for k, v in ccd.EVENT_DATES.items()))
     _say(f"Weighting     : value-weighted on {WEIGHT_COLUMN} at the EVENT date")
-    _say(f"Inputs        : {PANEL_PATH.name}, {SCORES_CSV.name}, "
+    _say(f"Exposure      : {TEXP_PANEL_CSV.name} at reference date {TEXP_REFERENCE_DATE}, "
+         f"one vintage for every run")
+    _say(f"Inputs        : {PANEL_PATH.name}, {TEXP_PANEL_CSV.name}, "
          f"{', '.join(r['out'].name for r in ec.RUNS)}")
     _say("NOT computed  : Sharpe, drawdown, turnover, capacity, GRS, spanning alpha, backtest "
          "returns.\n                Section 7.3 excludes them - this is a descriptive exhibit, "

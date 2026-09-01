@@ -12,7 +12,8 @@ The segment file carries no company-total row (geotp is only 2/3 plus non-geogra
 rows), so the denominator is built from every row in the firm-datadate group and the
 domestic + foreign vs total reconciliation is reported per firm-year as recon_gap.
 
-Reads clean_data/tariff_scores.csv; the scoring pipeline itself is not touched.
+Reads the 2025-04-02 cross-section of clean_data/texp_panel.csv; the scoring pipeline itself is
+not touched.
 
     python foreign_sales.py
 """
@@ -34,12 +35,22 @@ CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
 SEGMENT_FILE = BASE / "Compustat Geographic segment data.csv"
 BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
-SCORES_CSV = CLEAN_DIR / "tariff_scores.csv"
 FS_OUT = CLEAN_DIR / "foreign_sales_share.csv"
+
+# Exposure is read from the reference-date panel at ONE vintage, not from tariff_scores.csv.
+# Since the Step 2 rescale the scores table is one row per (permno, accession) across 17 reference
+# dates, so joining it on (permno, fiscal_year) does not fail - it silently widens this validation
+# from one cross-section to nine fiscal years (2,110 firm-years to 9,383). The measure validation
+# reported in section 7.1 is anchored on the 2025 event, so it takes the 2025 cross-section and
+# only that: one FS-TExp correlation, on the sample the event study actually uses.
+# 2025-04-02 is clean_controls_data.CYCLES["2025"]["texp_ref"]["impose"]; load_texp_vintage raises
+# and lists the alternatives if the panel ever stops carrying it.
+TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
+TEXP_REFERENCE_DATE = "2025-04-02"
 # CSV rather than Parquet throughout: Smart App Control blocks pyarrow's DLLs (build_notes 4b).
 # cik and accession must come back as strings or their zero padding is lost, exactly as gvkey
 # would be - the failure this module already documents for the unpadded segment export.
-SCORES_READ_DTYPES = {"cik": str, "accession": str, "scoring_flags": str}
+TEXP_READ_DTYPES = {"cik": str, "accession": str}
 SCATTER_OUT = OUTPUT_DIR / "texp_fs_scatter.png"
 REPORT_OUT = OUTPUT_DIR / "fs_validation_report.txt"
 
@@ -258,6 +269,26 @@ def link_permno(fs: pd.DataFrame, bridge: pd.DataFrame) -> tuple[pd.DataFrame, d
     return linked.drop(columns=["linkdt", "linkenddt", "_prim"]), link_stats
 
 
+def load_texp_vintage(path: Path | None = None,
+                      reference_date: str = TEXP_REFERENCE_DATE) -> pd.DataFrame:
+    """The scored TExp cross-section at one reference date, one row per firm.
+
+    Sliced before anything downstream sees it, so the correlation, the scatter and the report all
+    describe the same single vintage rather than a pool of nine.
+    """
+    path = TEXP_PANEL_CSV if path is None else path
+    if not path.exists():
+        raise FileNotFoundError(f"{path.name} not found; run build_texp_panel.py first.")
+    panel = pd.read_csv(path, dtype=TEXP_READ_DTYPES)
+    frame = panel[panel["reference_date"] == reference_date]
+    if frame.empty:
+        raise ValueError(f"{path.name} holds no cross-section at {reference_date}; available: "
+                         f"{', '.join(sorted(panel['reference_date'].unique()))}")
+    if frame["permno"].duplicated().any():
+        raise ValueError(f"the {reference_date} cross-section is not unique on permno")
+    return frame.reset_index(drop=True)
+
+
 def merge_texp(fs: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
     """Inner-join the FS panel to the scored TExp panel on (permno, fiscal_year)."""
     sc = scores.copy()
@@ -469,13 +500,15 @@ def write_report(seg: pd.DataFrame, kept: pd.DataFrame, lost: pd.DataFrame,
          f"{link_stats['ambiguous_resolved']:,}")
 
     _section("7. Merge to the scored TExp panel")
-    _say(f"  TExp scored firm-years                     {len(scores):>9,}")
+    _say(f"  TExp vintage                              {TEXP_REFERENCE_DATE:>10}  "
+         f"(one cross-section, not the pooled panel)")
+    _say(f"  TExp scored firms at that vintage           {len(scores):>9,}")
     _say(f"  FS firm-years with a permno                {len(linked):>9,}")
     _say(f"  = inner join on (permno, fiscal_year)      {len(merged):>9,} "
          f"({len(merged) / len(scores):.1%} of scored)")
     _say(f"  by fiscal year: {merged['fiscal_year'].value_counts().sort_index().to_dict()}")
     unmatched = len(scores) - len(merged)
-    _say(f"  scored firm-years with no FS match         {unmatched:>9,}")
+    _say(f"  scored firms with no FS match              {unmatched:>9,}")
     if merged.duplicated(["permno", "fiscal_year"]).any():
         raise ValueError("merged panel has duplicate (permno, fiscal_year) rows")
 
@@ -512,7 +545,7 @@ def write_report(seg: pd.DataFrame, kept: pd.DataFrame, lost: pd.DataFrame,
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
 def main() -> pd.DataFrame:
-    for path in (BRIDGE_CSV, SCORES_CSV):
+    for path in (BRIDGE_CSV, TEXP_PANEL_CSV):
         if not path.exists():
             raise FileNotFoundError(f"{path.name} not found; run the upstream pipeline first.")
 
@@ -525,8 +558,7 @@ def main() -> pd.DataFrame:
     bridge = pd.read_csv(BRIDGE_CSV, dtype=str)
     linked, link_stats = link_permno(fs, bridge)
 
-    scores = pd.read_csv(SCORES_CSV, dtype=SCORES_READ_DTYPES)
-    scores["scoring_flags"] = scores["scoring_flags"].fillna("")
+    scores = load_texp_vintage()
     merged = merge_texp(linked, scores)
 
     CLEAN_DIR.mkdir(exist_ok=True)

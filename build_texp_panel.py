@@ -78,7 +78,7 @@ def attach_scores(pull_rows: pd.DataFrame, scores: pd.DataFrame) -> tuple[pd.Dat
     """
     scores = scores.assign(permno=pd.to_numeric(scores["permno"]).astype("int64"))
     joined = pull_rows.merge(
-        scores[["permno", "accession"] + TEXP_COLUMNS],
+        scores[["permno", "accession", "fiscal_year"] + TEXP_COLUMNS],
         on=["permno", "accession"], how="left", validate="many_to_one")
     unmatched = joined[joined["TExp_item1a"].isna()]
     return joined[joined["TExp_item1a"].notna()].copy(), unmatched

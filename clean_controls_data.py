@@ -3,19 +3,22 @@ Step 4a - Script 1 of 3: cleaned, merged control panel for the section 7.2 event
 
 Merges CRSP daily returns, Compustat fundamentals (book equity, leverage), the CCM
 PERMNO-GVKEY-CIK bridge and the Ken French FF12 industry definitions into one daily panel
-covering the estimation and event windows of both 2025 tariff events.
+covering the estimation and event windows of one policy cycle's events.
 
-    impose  = 2025-04-02  (Liberation Day)
-    reverse = 2025-08-29  (Federal Circuit, V.O.S. Selections v. Trump)
+    --cycle 2025          impose  = 2025-04-02  (Liberation Day)              section 7.2
+                          reverse = 2025-08-29  (Federal Circuit, V.O.S. Selections v. Trump)
+    --cycle cross_cycle   7 Section 301 escalations 2018-2019 + 2 de-escalations   section 7.6
 
 Cleaning only. No abnormal returns, no market model, no regression - those are Scripts 2 and 3.
 
 Fundamentals are gated point-in-time on the date they actually became public: the real 10-K
 filing date from edgar_pull_log.csv where known, otherwise datadate + FUNDAMENTAL_LAG_DAYS.
 
-    python clean_controls_data.py
+    python clean_controls_data.py                    # 2025, the default
+    python clean_controls_data.py --cycle cross_cycle
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +32,6 @@ BASE = Path(__file__).resolve().parent
 CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
 
-DAILY_FILE = BASE / "Daily returns.csv"
 MONTHLY_RAW_FILE = BASE / "Monthly Returns.csv"   # unscreened history, for the momentum control
 FUNDA_FILE = BASE / "BM and Lev.csv"
 SICCODES_FILE = BASE / "Siccodes12.txt"
@@ -37,11 +39,107 @@ BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
 MONTHLY_CSV = CLEAN_DIR / "clean_returns.csv"
 EDGAR_LOG = BASE / "edgar_pull_log.csv"
 
+# --------------------------------------------------------------------------- #
+# Cycles                                                                      #
+# --------------------------------------------------------------------------- #
+# One registry for both policy cycles, selected by --cycle. Scripts 2 and 3 import it rather than
+# re-declaring dates or paths, the single-definition rule already used for EVENT_DATES and
+# PANEL_OUT. The shape mirrors edgar_pull.SCOPES/BATCHES: a dict of named configurations chosen by
+# a CLI flag. "2025" is the default and reproduces every pre-existing output byte for byte.
+#
+# Each cycle supplies:
+#   daily_files    CRSP daily exports, concatenated then de-duplicated (see load_daily)
+#   ff_daily       FF5+MOM daily factor files, same treatment (estimate_car.load_factors)
+#   events         event key -> date. Keys must be unique per date: Script 3 maps date -> key and
+#                  asserts uniqueness on (event, permno).
+#   texp_ref       event key -> the edgar_pull reference date whose 10-K supplies that event's
+#                  TExp. Identity for the cross cycle; both 2025 legs share 2025-04-02 because H1
+#                  requires the exposure held fixed across the imposition and reversal legs.
+#   expected_sign  event key -> the H1/H4 predicted sign of b. Stored, never derived from the key.
+#   anchor_offset  trading days from the event at which the estimation window closes, where the
+#                  cycle uses a uniform rule rather than per-run policy anchors.
+#   sign_flip_pair the (tightening, loosening) runs whose coefficients carry the cycle's sign-flip
+#                  test, named rather than inferred. The cross cycle pairs its primary reversal
+#                  with the escalation immediately before it: 2,394 of the 2,468 firms present at
+#                  both carry the identical accession (97.0%), so that comparison holds exposure
+#                  fixed and puts the identifying variation in the returns, as section 7.2 does
+#                  by construction.
+#   suffix         appended to every output filename.
+CROSS_CYCLE_EVENTS = {
+    # Section 301 escalations, Bruno, Goltz & Luyten (2024) Table 3, used exactly as published.
+    "escalate_20180301": "2018-03-01",
+    "escalate_20180322": "2018-03-22",
+    "escalate_20180402": "2018-04-02",
+    "escalate_20180615": "2018-06-15",
+    "escalate_20180917": "2018-09-17",
+    "escalate_20190510": "2019-05-10",
+    "escalate_20190823": "2019-08-23",
+    # De-escalations: the primary reversal and the Phase One robustness date.
+    "de_escalate_20191011": "2019-10-11",
+    "de_escalate_20200115": "2020-01-15",
+}
+
+CYCLES = {
+    "2025": {
+        "daily_files": [BASE / "Daily returns.csv"],
+        "ff_daily": [BASE / "Fama French daily.csv"],
+        "events": {"impose": "2025-04-02", "reverse": "2025-08-29"},
+        "texp_ref": {"impose": "2025-04-02", "reverse": "2025-04-02"},
+        "expected_sign": {"impose": -1, "reverse": +1},
+        "anchor_offset": None,          # per-run policy anchors; see estimate_car.RUNS_2025
+        "sign_flip_pair": ("imposition_primary", "reversal_primary"),
+        "suffix": "",
+    },
+    "cross_cycle": {
+        # Two exports: the original 2018-2020 pull plus the 2017 extension that the 252-day
+        # estimation window at 2018-03-01 requires. Their 61-day overlap is byte-identical
+        # (174,902 rows, no value differences), and dedupe_daily raises if that ever stops holding.
+        "daily_files": [BASE / "CRSP Daily returns cross cycle.csv",
+                        BASE / "CRSp Daily returns cross cycle pt2.csv"],
+        "ff_daily": [BASE / "FF5+MOM daily Cross cycle.csv",
+                     BASE / "FF5 + MOM daily cross cycle pt2.csv"],
+        "events": CROSS_CYCLE_EVENTS,
+        "texp_ref": {k: v for k, v in CROSS_CYCLE_EVENTS.items()},
+        "expected_sign": {k: (+1 if k.startswith("de_escalate") else -1)
+                          for k in CROSS_CYCLE_EVENTS},
+        # Nine events cannot each carry a defensible hand-picked policy anchor - the Section 301
+        # process ran continuously from January 2018, so no date separates pre- from
+        # post-repricing. -11 is the latest uniform close that leaves the widest event window
+        # [-10,+10] free of its own estimation window.
+        "anchor_offset": -11,
+        "sign_flip_pair": ("escalate_20190823", "de_escalate_20191011"),
+        "suffix": "_cross_cycle",
+    },
+}
+
+DEFAULT_CYCLE = "2025"
+CYCLE = DEFAULT_CYCLE
+
+# Set by select_cycle(); declared here so the module reads top to bottom.
+DAILY_FILES: list[Path] = CYCLES[DEFAULT_CYCLE]["daily_files"]
+EVENT_DATES: dict[str, str] = CYCLES[DEFAULT_CYCLE]["events"]
 PANEL_OUT = OUTPUT_DIR / "controls_panel"        # extension added from OUTPUT_FORMAT
 REPORT_OUT = OUTPUT_DIR / "cleaning_validation_report.txt"
 
-# Event dates (research design section 7.2). Both must be trading days.
-EVENT_DATES = {"impose": "2025-04-02", "reverse": "2025-08-29"}
+
+def select_cycle(name: str) -> dict:
+    """Point the module's cycle-dependent constants at one entry of CYCLES.
+
+    Called once from main() off the parsed --cycle argument, and once by Scripts 2 and 3 before
+    they read any path. A single explicit entry point rather than configuration threaded through
+    forty function signatures; nothing else in the module rebinds these names.
+    """
+    global CYCLE, DAILY_FILES, EVENT_DATES, PANEL_OUT, REPORT_OUT
+    if name not in CYCLES:
+        raise ValueError(f"unknown cycle {name!r}; choose from {sorted(CYCLES)}")
+    cycle = CYCLES[name]
+    CYCLE = name
+    DAILY_FILES = cycle["daily_files"]
+    EVENT_DATES = cycle["events"]
+    PANEL_OUT = OUTPUT_DIR / f"controls_panel{cycle['suffix']}"
+    REPORT_OUT = OUTPUT_DIR / f"cleaning_validation_report{cycle['suffix']}.txt"
+    return cycle
+
 
 EST_WINDOW = (-250, -46)          # market-model estimation window, trading days
 MAX_EVENT_WINDOW = (-10, 10)      # widest event window used in the section 8 robustness table
@@ -75,7 +173,7 @@ FUNDA_NUMERIC = ["at", "ceq", "dlc", "dltt", "pstk", "pstkl", "pstkr", "pstkrv",
 
 SPOT_CHECK_PERMNOS = [10107, 93436, 12490, 10145, 14593]   # MSFT, TSLA, IBM, Honeywell, Apple
 
-OUTPUT_COLUMNS = [
+BASE_OUTPUT_COLUMNS = [
     "permno", "permco", "ticker", "date", "gvkey", "cik",
     "ret", "prc", "shrout", "me", "me_lag", "ln_me_lag",
     "siccd", "ff12_num", "ff12", "sic_invalid", "in_screened_universe",
@@ -83,8 +181,12 @@ OUTPUT_COLUMNS = [
     "at", "ceq", "txditc", "txditc_imputed", "ps", "be", "debt",
     "bm", "lev", "be_nonpositive", "ceq_nonpositive",
     "mom12", "mom12_n_months",
-    "alive_at_impose", "alive_at_reverse",
 ]
+
+
+def output_columns() -> list[str]:
+    """Panel columns, with one alive_at_<event> flag per event in the active cycle."""
+    return BASE_OUTPUT_COLUMNS + [f"alive_at_{name}" for name in EVENT_DATES]
 
 _REPORT: list[str] = []
 
@@ -108,28 +210,31 @@ def _events() -> dict[str, pd.Timestamp]:
 # --------------------------------------------------------------------------- #
 # CRSP daily: schema, calendar, load                                          #
 # --------------------------------------------------------------------------- #
-def validate_daily_schema(path: Path) -> None:
-    """Halt before any processing if the CRSP daily export is not the expected shape.
+def validate_daily_schema(paths: list[Path]) -> None:
+    """Halt before any processing if a CRSP daily export is not the expected shape.
 
-    Reads the header only. A silently renamed or reordered WRDS export would otherwise surface
-    as a wrong number many steps downstream.
+    Reads headers only. A silently renamed or reordered WRDS export would otherwise surface as a
+    wrong number many steps downstream. Every file must carry the same required fields, since they
+    are concatenated into one frame.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"{path.name} not found; it is a required raw input.")
-    header = list(pd.read_csv(path, nrows=0).columns)
-    missing = [c for c in DAILY_REQUIRED if c not in header]
-    if missing:
-        raise ValueError(
-            f"{path.name} is missing required field(s) {missing}. "
-            f"Found columns: {header}. Re-pull the CRSP daily extract with these fields."
-        )
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"{path.name} not found; it is a required raw input.")
+        header = list(pd.read_csv(path, nrows=0).columns)
+        missing = [c for c in DAILY_REQUIRED if c not in header]
+        if missing:
+            raise ValueError(
+                f"{path.name} is missing required field(s) {missing}. "
+                f"Found columns: {header}. Re-pull the CRSP daily extract with these fields."
+            )
 
 
-def build_calendar(path: Path) -> np.ndarray:
-    """Collect the distinct trading days from the daily file (first pass, dates only)."""
+def build_calendar(paths: list[Path]) -> np.ndarray:
+    """Collect the distinct trading days across the daily files (first pass, dates only)."""
     dates: set = set()
-    for chunk in pd.read_csv(path, usecols=["DlyCalDt"], chunksize=CHUNK_ROWS):
-        dates.update(chunk["DlyCalDt"].unique())
+    for path in paths:
+        for chunk in pd.read_csv(path, usecols=["DlyCalDt"], chunksize=CHUNK_ROWS):
+            dates.update(chunk["DlyCalDt"].unique())
     return pd.DatetimeIndex(sorted(pd.to_datetime(list(dates)))).to_numpy()
 
 
@@ -144,7 +249,8 @@ def derive_bounds(calendar: np.ndarray) -> tuple[pd.Timestamp, pd.Timestamp, dic
     for name, day in _events().items():
         pos = cal.searchsorted(day)
         if pos >= len(cal) or cal[pos] != day:
-            raise ValueError(f"event '{name}' {day:%Y-%m-%d} is not a trading day in {DAILY_FILE.name}")
+            raise ValueError(f"event '{name}' {day:%Y-%m-%d} is not a trading day in "
+                             f"{', '.join(p.name for p in DAILY_FILES)}")
         idx[name] = int(pos)
 
     start_i = min(i + EST_WINDOW[0] for i in idx.values())
@@ -162,14 +268,21 @@ def derive_bounds(calendar: np.ndarray) -> tuple[pd.Timestamp, pd.Timestamp, dic
     return cal[clipped_start], cal[clipped_end], stats
 
 
-def load_daily(path: Path, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Chunked read of the daily file, filtered to the derived span inside each chunk."""
+def load_daily(paths: list[Path], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Chunked read of the daily files, filtered to the derived span inside each chunk.
+
+    Where a cycle supplies more than one export the frames are concatenated here and reconciled by
+    dedupe_daily, which drops exact duplicate rows and raises on a (permno, date) pair carrying
+    differing values. Overlapping exports are therefore merged by the same code path that has
+    always handled CRSP's own repeated rows, rather than by a separate merge step.
+    """
     dtypes = {"PERMNO": "int32", "PERMCO": "int32", "Ticker": "object",
               "DlyPrc": "float64", "DlyRet": "float64", "ShrOut": "float64"}
     kept = []
-    for chunk in pd.read_csv(path, usecols=DAILY_REQUIRED, dtype=dtypes, chunksize=CHUNK_ROWS):
-        chunk["DlyCalDt"] = pd.to_datetime(chunk["DlyCalDt"])
-        kept.append(chunk[(chunk["DlyCalDt"] >= start) & (chunk["DlyCalDt"] <= end)])
+    for path in paths:
+        for chunk in pd.read_csv(path, usecols=DAILY_REQUIRED, dtype=dtypes, chunksize=CHUNK_ROWS):
+            chunk["DlyCalDt"] = pd.to_datetime(chunk["DlyCalDt"])
+            kept.append(chunk[(chunk["DlyCalDt"] >= start) & (chunk["DlyCalDt"] <= end)])
     daily = pd.concat(kept, ignore_index=True)
     return daily.rename(columns={"PERMNO": "permno", "PERMCO": "permco", "Ticker": "ticker",
                                  "DlyCalDt": "date", "DlyPrc": "prc", "DlyRet": "ret",
@@ -658,7 +771,7 @@ def restrict_universe(daily: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
 def write_panel(daily: pd.DataFrame) -> Path:
     """Write the panel in the configured format."""
     OUTPUT_DIR.mkdir(exist_ok=True)
-    out = daily.reindex(columns=OUTPUT_COLUMNS)
+    out = daily.reindex(columns=output_columns())
     path = PANEL_OUT.with_suffix(f".{OUTPUT_FORMAT}")
     if OUTPUT_FORMAT == "parquet":
         out.to_parquet(path, index=False)
@@ -694,7 +807,8 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
     events = _events()
 
     _say("=" * 78)
-    _say("SECTION 7.2 CONTROLS PANEL - CLEANING VALIDATION REPORT")
+    _say(f"SECTION {'7.6 CROSS-CYCLE' if CYCLE != DEFAULT_CYCLE else '7.2'} CONTROLS PANEL - "
+         f"CLEANING VALIDATION REPORT")
     _say("=" * 78)
     _say("Events        : " + ", ".join(f"{k}={v:%Y-%m-%d}" for k, v in events.items()))
     _say(f"Derived span  : {start:%Y-%m-%d} .. {end:%Y-%m-%d} "
@@ -705,7 +819,8 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
              f"{stats['bounds']['short_at_end']} at the end. Estimation windows will be truncated.")
     _say(f"               from estimation window {EST_WINDOW}, event window {MAX_EVENT_WINDOW}, "
          f"buffer {BUFFER_TRADING_DAYS}")
-    _say(f"Output        : {panel_path.name}  ({len(panel):,} rows x {len(OUTPUT_COLUMNS)} cols)")
+    _say(f"Cycle         : {CYCLE}   inputs: {', '.join(p.name for p in DAILY_FILES)}")
+    _say(f"Output        : {panel_path.name}  ({len(panel):,} rows x {len(output_columns())} cols)")
 
     _section("1. Funnel (every row and firm accounted for)")
     d, m, lk, fm, uni = (stats["dedupe"], stats["mom"], stats["link"],
@@ -725,7 +840,7 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
         raise ValueError("universe funnel does not reconcile")
     _say(f"  = rows in final panel                      {uni['rows_out']:>10,}")
     for name, n in uni["alive"].items():
-        _say(f"    firms trading on {name:<8s} ({events[name]:%Y-%m-%d})  {n:>10,}")
+        _say(f"    firms trading on {name:<20s} ({events[name]:%Y-%m-%d})  {n:>10,}")
 
     _section("2. Grain integrity")
     _say("  de-duplication, the momentum merge, the CCM link merge, the fundamentals as-of merge")
@@ -850,7 +965,7 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
     _say(f"  rows inside the screen                     {sc['rows_in_screen']:>10,}")
     _say(f"  rows outside the screen                    {sc['rows_out_of_screen']:>10,}")
     for name, n in sc["at_event"].items():
-        _say(f"    firms inside the screen on {name:<8s}     {n:>10,}"
+        _say(f"    firms inside the screen on {name:<20s}  {n:>10,}"
              f"   (of {uni['alive'][name]:,} trading)")
 
     _section("10. Distributions of constructed variables")
@@ -891,10 +1006,10 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
         for ev_name, day in events.items():
             r = rows[rows["date"] == day]
             if r.empty:
-                _say(f"    {ev_name:<8s} {day:%Y-%m-%d}  no observation on this date")
+                _say(f"    {ev_name:<20s} {day:%Y-%m-%d}  no observation on this date")
                 continue
             r = r.iloc[0]
-            _say(f"    {ev_name:<8s} {day:%Y-%m-%d}  ticker={r['ticker']} "
+            _say(f"    {ev_name:<20s} {day:%Y-%m-%d}  ticker={r['ticker']} "
                  f"gvkey={r['gvkey']} ff12={r['ff12']} (siccd {r['siccd']})")
             _say(f"      prc={_num(r['prc'], ',.2f')}  "
                  f"me_lag={_num(r['me_lag'] / ME_TO_MILLIONS, ',.0f')}m  "
@@ -917,16 +1032,17 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
-def main() -> pd.DataFrame:
+def main(cycle: str = DEFAULT_CYCLE) -> pd.DataFrame:
+    select_cycle(cycle)
     for path in (BRIDGE_CSV, MONTHLY_CSV):
         if not path.exists():
             raise FileNotFoundError(f"{path.name} not found; run clean_data.py first.")
 
-    validate_daily_schema(DAILY_FILE)
-    calendar = build_calendar(DAILY_FILE)
+    validate_daily_schema(DAILY_FILES)
+    calendar = build_calendar(DAILY_FILES)
     start, end, bound_stats = derive_bounds(calendar)
 
-    daily = load_daily(DAILY_FILE, start, end)
+    daily = load_daily(DAILY_FILES, start, end)
     daily, dedupe_stats = dedupe_daily(daily)
     daily, me_stats = add_market_equity(daily)
 
@@ -960,5 +1076,13 @@ def main() -> pd.DataFrame:
     return daily
 
 
+def parse_args(argv: list[str] | None = None) -> str:
+    """The --cycle selector, shared in shape with Scripts 2 and 3 and with edgar_pull."""
+    ap = argparse.ArgumentParser(description="Controls panel for the section 7.2 event study.")
+    ap.add_argument("--cycle", choices=sorted(CYCLES), default=DEFAULT_CYCLE,
+                    help="policy cycle to build the panel for (default: %(default)s)")
+    return ap.parse_args(argv).cycle
+
+
 if __name__ == "__main__":
-    main()
+    main(parse_args())
