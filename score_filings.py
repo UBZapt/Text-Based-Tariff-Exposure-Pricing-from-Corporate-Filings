@@ -10,17 +10,26 @@ per instruction (the single deviation):
 
     TExp = (sentences containing >= 1 tariff term) / (total sentences in that unit)
 
-The two stages are deliberately separate: ``tokenise_sections`` holds no matching logic and
-``score_section`` holds no sentence-splitting logic.
+The two stages are deliberately separate: ``tokenise_filing`` holds no matching logic and
+``score_section`` holds no sentence-splitting logic. They are driven from one streaming loop
+(``score_stream``) so a filing's sentences are discarded once scored - the corpus is ~26
+million sentences and cannot be materialised.
+
+Keyed on the document. Scores are raw only; the cross-sectional standardisation belongs to a
+reference date, which this table has no column for, so it lives in build_texp_panel.py. Rows
+are flushed as each filing finishes, so an interrupted run resumes.
 
     python score_filings.py                  # whole universe
     python score_filings.py --n-ciks 50      # first N distinct CIKs by PERMNO
+    python score_filings.py --status         # done/remaining, no work
 """
 
 import argparse
+import csv
 import json
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
@@ -43,10 +52,12 @@ SCORES_OUT = CLEAN_DIR / "tariff_scores.csv"
 DIAG_OUT = OUTPUT_DIR / "scoring_diagnostics.csv"
 TERM_HITS_OUT = OUTPUT_DIR / "term_hits.csv"
 
-# The pull's staleness window bounded the filing date, not the fiscal period, so late filers
-# reporting FY2022/FY2023 would carry pre-tariff-cycle disclosure into a Liberation Day
-# exposure measure. Restricting the fiscal year keeps the text contemporaneous with the cycle.
-FISCAL_YEARS = (2024, 2025)
+# Contemporaneity is NOT enforced here any more. Scoring is a property of the document, so it
+# runs once per accession and cannot know which reference date will use the result; the
+# corpus now spans FY2016-FY2025 across 17 reference dates. The rule moved to
+# build_texp_panel.MAX_PERIOD_STALENESS_MONTHS, where the reference date is known and the
+# filter can be applied per cross-section. The Item 1A filter below stays, because it is a
+# property of the document rather than of the date.
 
 MIN_SENTENCE_CHARS = 15      # below this a "sentence" is likely a tokenisation artifact
 IMPLAUSIBLE_TEXP = 0.5       # tripwire for double-counting or boilerplate artifacts
@@ -69,13 +80,28 @@ UTILITY_CONTEXT_RE = re.compile(
 EN_DASH, EM_DASH = chr(0x2013), chr(0x2014)
 DASH_CLASS = "[-" + EN_DASH + EM_DASH + "]"
 
+# Dash variants of the one list term that carries an en dash, counted during the scoring pass
+# so the diagnostic costs no extra read of the corpus. Compiled once at import.
+EN_DASH_TERM = "U.S." + EN_DASH + "China tariffs"
+EN_DASH_VARIANTS = [
+    ("exact, U+2013 en dash", r"U\.S\." + EN_DASH + r"China tariffs"),
+    ("hyphen variant  U.S.-China tariffs", r"U\.S\.-China tariffs"),
+    ("U.S.<any dash>China, any context", r"U\.S\." + DASH_CLASS + r"China"),
+    ("US<any dash>China, any context", r"(?<!\w)US" + DASH_CLASS + r"China"),
+    ("China tariffs, loose", r"China\s+tariffs"),
+]
+EN_DASH_COMPILED = [(label, re.compile(p, re.IGNORECASE)) for label, p in EN_DASH_VARIANTS]
+
 TEXP_COLUMNS = ["TExp_item1a", "TExp_rest", "TExp_combined"]
+# Raw scores only. The standardised TExp_*_z columns this table used to carry were pooled over
+# the whole file, which is meaningful for one reference date and meaningless across 17: the
+# cross-section a z-score belongs to is a reference date, which this table does not have a
+# column for. They now live in build_texp_panel.py, standardised within each date.
 OUTPUT_COLUMNS = [
     "permno", "cik", "accession", "filing_date", "fiscal_year",
     "B_item1a", "B_rest", "bigram_hit_count_item1a", "bigram_hit_count_rest",
     "utility_context_hits",
-    "TExp_item1a", "TExp_rest", "TExp_combined",
-    "TExp_item1a_z", "TExp_rest_z", "TExp_combined_z", "scoring_flags",
+    "TExp_item1a", "TExp_rest", "TExp_combined", "scoring_flags",
 ]
 
 
@@ -176,28 +202,36 @@ def build_gates(terms: list[str]) -> dict[str, tuple[str, ...]]:
 def resolve_scope_ciks(n_ciks: int | None) -> set[str]:
     """Resolve this run's CIK universe, reusing edgar_pull's ordering rather than re-deriving it.
 
-    With ``n_ciks=None`` this is the whole universe and the filter acts as a sanity check -
-    a cleaned filing should never fall outside the bridge universe the pull was drawn from.
+    With ``n_ciks=None`` this is every CIK anywhere in the bridge and the filter acts as a
+    sanity check - a cleaned filing should never fall outside the universe the pull was drawn
+    from. It must NOT be the set resolved at one reference date: _resolve_cik picks one link
+    row per date, so a firm linked in 2018 but not in 2025 would be dropped as
+    'cik_outside_universe' purely because of when the scope was evaluated. This is the same
+    trap CLAUDE.md records for prune_stale, which is why bridge_ciks() exists.
     """
+    if n_ciks is None:
+        return edgar_pull.bridge_ciks()
     firms = edgar_pull.resolve_firms(edgar_pull.BRIDGE_CSV, edgar_pull.REFERENCE_DATE)
     scope, _ = edgar_pull.select_gap_firms(firms, set(), n_ciks)
     return {f["cik"] for f in scope if f["cik"]}
 
 
-def load_scope(filings: pd.DataFrame,
-               scope_ciks: set[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Apply the three sample filters in order, keeping every exclusion attributable.
+def load_scope(filings: pd.DataFrame, scope_ciks: set[str],
+               done: set[str] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the sample filters in order, keeping every exclusion attributable.
 
     1. CIK inside the pull universe - a sanity check at full scope, a real filter under
        ``--n-ciks``.
-    2. ``fiscal_year`` in FISCAL_YEARS - see the constant for why the filing-date window is
-       not sufficient on its own.
-    3. Item 1A located - without it there is no Item 1A denominator, and ``rest_text`` holds
+    2. Item 1A located - without it there is no Item 1A denominator, and ``rest_text`` holds
        the whole document rather than the complement of Item 1A, so neither section score is
        comparable with the rest of the panel.
 
+    The fiscal-year filter that used to sit between these two has moved to the panel step; see
+    the note where FISCAL_YEARS was defined.
+
     Returns (kept, dropped); ``dropped`` carries a ``drop_reason`` column and is reported by
-    the caller, never silently lost.
+    the caller, never silently lost. ``done`` accessions are removed from ``kept`` after the
+    filters run, so the reported funnel still describes the whole corpus on a resumed run.
     """
     stages, remaining = [], filings
 
@@ -205,51 +239,35 @@ def load_scope(filings: pd.DataFrame,
     stages.append(remaining[~in_scope].assign(drop_reason="cik_outside_universe"))
     remaining = remaining[in_scope]
 
-    in_years = remaining["fiscal_year"].isin(FISCAL_YEARS)
-    stages.append(remaining[~in_years].assign(drop_reason="fiscal_year_out_of_range"))
-    remaining = remaining[in_years]
-
     found = remaining["item_1a_found"]
     stages.append(remaining[~found].assign(drop_reason="item_1a_not_found"))
     kept = remaining[found].copy()
 
     if kept.empty:
-        raise ValueError(f"No filings in {clean_filings.CLEAN_OUT.name} survive the scope, fiscal-year "
-                         f"{FISCAL_YEARS} and Item 1A filters.")
+        raise ValueError(f"No filings in {clean_filings.CLEAN_OUT.name} survive the scope "
+                         f"and Item 1A filters.")
+    if done:
+        kept = kept[~kept["accession"].isin(done)]
     return kept, pd.concat(stages, ignore_index=True)
 
 
 # --------------------------------------------------------------------------- #
 # Stage 2 - tokenisation (no bigram logic in this section)                    #
 # --------------------------------------------------------------------------- #
-def tokenise_sections(kept: pd.DataFrame) -> list[dict]:
-    """Split each filing's two sections into sentences, independently.
+def tokenise_filing(item_1a_text: str, rest_text: str) -> tuple[list[str], list[str]]:
+    """Split one filing's two sections into sentences, independently.
 
     sent_tokenize is run separately on item_1a_text and rest_text - never on a
     concatenation - so the two sentence lists and their counts B_item1a / B_rest are
     genuinely per section. Because the sections are tokenised apart, B_item1a + B_rest can
     differ by a sentence or two from tokenising the whole document, since the section
     boundary is also a forced sentence boundary.
+
+    Holds no matching logic: this function never sees the term list. It returns one filing at
+    a time rather than the whole corpus because the full corpus is ~26 million sentence
+    strings, which cannot be held in memory alongside everything else the run needs.
     """
-    tokenised, total = [], len(kept)
-    for i, f in enumerate(kept.itertuples(index=False), 1):
-        sentences_item1a = nltk.sent_tokenize(f.item_1a_text)
-        sentences_rest = nltk.sent_tokenize(f.rest_text)
-        tokenised.append({
-            "permno": f.permno, "cik": f.cik, "accession": f.accession,
-            "filing_date": f.filing_date, "fiscal_year": f.fiscal_year,
-            "sentences_item1a": sentences_item1a,
-            "sentences_rest": sentences_rest,
-            "B_item1a": len(sentences_item1a),
-            "B_rest": len(sentences_rest),
-        })
-        if i % PROGRESS_EVERY == 0 or i == total:
-            print(f"  [tokenise] {i:,}/{total:,} filings", flush=True)
-    print(f"Stage 2 - tokenised {len(tokenised):,} filings into "
-          f"{sum(t['B_item1a'] + t['B_rest'] for t in tokenised):,} sentences "
-          f"({sum(t['B_item1a'] for t in tokenised):,} Item 1A, "
-          f"{sum(t['B_rest'] for t in tokenised):,} rest).")
-    return tokenised
+    return nltk.sent_tokenize(item_1a_text), nltk.sent_tokenize(rest_text)
 
 
 # --------------------------------------------------------------------------- #
@@ -291,9 +309,35 @@ def score_section(sentences: list[str], patterns: dict[str, re.Pattern],
     return SectionScore(n_hit, per_term, examples, n_multi_term, n_utility)
 
 
-def score_filings(tokenised: list[dict], patterns: dict[str, re.Pattern],
-                  gates: dict[str, tuple[str, ...]]) -> tuple[pd.DataFrame, dict]:
-    """Score every filing and assemble the output table plus corpus diagnostics.
+def open_scores_log():
+    """Open tariff_scores.csv for append, writing the header if it is new.
+
+    Mirrors clean_filings.open_clean_log and edgar_pull.open_log: one flush per filing, so an
+    interrupted scoring run keeps every row it produced and re-running resumes.
+    """
+    CLEAN_DIR.mkdir(exist_ok=True)
+    is_new = not SCORES_OUT.exists() or SCORES_OUT.stat().st_size == 0
+    fh = SCORES_OUT.open("a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(fh, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+    if is_new:
+        writer.writeheader()
+        fh.flush()
+    return fh, writer
+
+
+def score_stream(kept: pd.DataFrame, patterns: dict[str, re.Pattern],
+                 gates: dict[str, tuple[str, ...]], writer, fh) -> tuple[pd.DataFrame, dict]:
+    """Tokenise and score each filing in one streaming pass, flushing rows as they finish.
+
+    Stages 2 and 3 remain separate in logic - tokenise_filing never sees the term list and
+    score_section never splits sentences - but they are driven from a single loop so a
+    filing's sentences are discarded as soon as it is scored. The previous shape materialised
+    every sentence of the corpus in a list before scoring any of it, which at 26 million
+    sentences cannot fit in memory.
+
+    Three corpus diagnostics that used to require their own full pass over the text are
+    accumulated here instead: the removed-term audit, the short-sentence tally and the
+    en-dash variant counts.
 
     Zero denominators are handled explicitly: a section with no sentences gets NaN rather
     than a division, and is flagged. TExp_combined is the pooled document rate, so one
@@ -305,12 +349,52 @@ def score_filings(tokenised: list[dict], patterns: dict[str, re.Pattern],
     term_rest: Counter = Counter()
     term_filings: Counter = Counter()
     n_multi_term = n_utility = 0
+    b_1a_total = b_rest_total = 0
 
-    for t in tokenised:
-        s_1a = score_section(t["sentences_item1a"], patterns, gates)
-        s_rest = score_section(t["sentences_rest"], patterns, gates)
-        b_1a, b_rest = t["B_item1a"], t["B_rest"]
+    removed_patterns = compile_patterns(REMOVED_TERMS)
+    removed_gates = build_gates(REMOVED_TERMS)
+    removed_tally = {term: {"sentences": 0, "filings": 0} for term in REMOVED_TERMS}
+    short = {"item1a": [0, 0], "rest": [0, 0]}      # [n_all, n_short]
+    short_examples: list[str] = []
+    en_counts = {label: 0 for label, _ in EN_DASH_VARIANTS}
+    n_en = n_em = 0
+
+    total, t0 = len(kept), time.monotonic()
+    for i, f in enumerate(kept.itertuples(index=False), 1):
+        item_1a_text, rest_text = clean_filings.read_clean_text(f.accession)
+        sentences_item1a, sentences_rest = tokenise_filing(item_1a_text, rest_text)
+
+        s_1a = score_section(sentences_item1a, patterns, gates)
+        s_rest = score_section(sentences_rest, patterns, gates)
+        b_1a, b_rest = len(sentences_item1a), len(sentences_rest)
         b_total = b_1a + b_rest
+        b_1a_total += b_1a
+        b_rest_total += b_rest
+
+        # --- diagnostics folded into this pass ---
+        seen: Counter = Counter()
+        for sentence in sentences_item1a + sentences_rest:
+            low = sentence.lower()
+            for term in REMOVED_TERMS:
+                if (all(w in low for w in removed_gates[term])
+                        and removed_patterns[term].search(sentence)):
+                    seen[term] += 1
+        for term, n in seen.items():
+            removed_tally[term]["sentences"] += n
+            removed_tally[term]["filings"] += 1
+
+        for key, sentences in (("item1a", sentences_item1a), ("rest", sentences_rest)):
+            short[key][0] += len(sentences)
+            brief = [s for s in sentences if len(s.strip()) < MIN_SENTENCE_CHARS]
+            short[key][1] += len(brief)
+            if len(short_examples) < 8:
+                short_examples += brief[:2]
+
+        both = item_1a_text + "\n" + rest_text
+        n_en += both.count(EN_DASH)
+        n_em += both.count(EM_DASH)
+        for label, pattern in EN_DASH_COMPILED:
+            en_counts[label] += len(pattern.findall(both))
 
         flags = []
         if b_1a == 0:
@@ -333,11 +417,11 @@ def score_filings(tokenised: list[dict], patterns: dict[str, re.Pattern],
         term_filings.update(set(s_1a.per_term) | set(s_rest.per_term))
         n_multi_term += s_1a.n_multi_term + s_rest.n_multi_term
         n_utility += s_1a.n_utility + s_rest.n_utility
-        examples[t["accession"]] = {"item_1a": s_1a.examples, "rest": s_rest.examples}
+        examples[f.accession] = {"item_1a": s_1a.examples, "rest": s_rest.examples}
 
-        rows.append({
-            "permno": t["permno"], "cik": t["cik"], "accession": t["accession"],
-            "filing_date": t["filing_date"], "fiscal_year": t["fiscal_year"],
+        row = {
+            "permno": f.permno, "cik": f.cik, "accession": f.accession,
+            "filing_date": f.filing_date, "fiscal_year": f.fiscal_year,
             "B_item1a": b_1a, "B_rest": b_rest,
             "bigram_hit_count_item1a": s_1a.n_hit,
             "bigram_hit_count_rest": s_rest.n_hit,
@@ -345,55 +429,33 @@ def score_filings(tokenised: list[dict], patterns: dict[str, re.Pattern],
             "TExp_item1a": texp_1a, "TExp_rest": texp_rest,
             "TExp_combined": texp_combined,
             "scoring_flags": "; ".join(flags),
-        })
+        }
+        writer.writerow(row)
+        fh.flush()
+        rows.append(row)
 
-    scores = add_z_scores(pd.DataFrame(rows)).reindex(columns=OUTPUT_COLUMNS)
+        if i % PROGRESS_EVERY == 0 or i == total:
+            elapsed = time.monotonic() - t0
+            print(f"[progress] {i:,}/{total:,} ({i / total:.1%}) | "
+                  f"{b_1a_total + b_rest_total:,} sentences | "
+                  f"{elapsed / 60:.1f} min elapsed | "
+                  f"ETA {(total - i) * elapsed / i / 60:.0f} min", flush=True)
+
+    scores = pd.DataFrame(rows).reindex(columns=OUTPUT_COLUMNS)
     total_hits = int(scores["bigram_hit_count_item1a"].sum()
                      + scores["bigram_hit_count_rest"].sum())
+    print(f"\nStage 2 - tokenised {len(rows):,} filings into "
+          f"{b_1a_total + b_rest_total:,} sentences "
+          f"({b_1a_total:,} Item 1A, {b_rest_total:,} rest).")
     print(f"Stage 3 - {total_hits:,} hit sentences across the sample "
           f"({n_multi_term:,} matched more than one term).\n")
+    audit = pd.DataFrame([{"term": t, **v} for t, v in removed_tally.items()])
     return scores, {"term_1a": term_1a, "term_rest": term_rest,
                     "term_filings": term_filings, "examples": examples,
                     "n_multi_term": n_multi_term, "n_utility": n_utility,
-                    "total_hits": total_hits}
-
-
-def add_z_scores(scores: pd.DataFrame) -> pd.DataFrame:
-    """Add the cross-sectionally standardised exposure columns required by section 7.1.
-
-    Standardised across the whole pull vintage rather than within fiscal_year: after the
-    FISCAL_YEARS filter this corpus is a single reference-date vintage, and fiscal_year here
-    separates December from June fiscal year-ends rather than separating years of data, so
-    grouping on it would fold fiscal year-end effects into the measure. When a second vintage
-    is pulled, the grouping is the reference date. NaN scores stay NaN and are excluded from
-    the mean and standard deviation.
-    """
-    for col in TEXP_COLUMNS:
-        sd = scores[col].std()
-        scores[f"{col}_z"] = ((scores[col] - scores[col].mean()) / sd
-                              if sd and pd.notna(sd) else float("nan"))
-    return scores
-
-
-def audit_removed_terms(tokenised: list[dict]) -> pd.DataFrame:
-    """Count what the removed terms would have matched, without letting them into any score.
-
-    Keeps the removal decision evidenced on the full corpus rather than resting on the
-    35-filing pilot that prompted it.
-    """
-    patterns, gates = compile_patterns(REMOVED_TERMS), build_gates(REMOVED_TERMS)
-    tally = {term: {"sentences": 0, "filings": 0} for term in REMOVED_TERMS}
-    for t in tokenised:
-        seen: Counter = Counter()
-        for sentence in t["sentences_item1a"] + t["sentences_rest"]:
-            low = sentence.lower()
-            for term in REMOVED_TERMS:
-                if all(w in low for w in gates[term]) and patterns[term].search(sentence):
-                    seen[term] += 1
-        for term, n in seen.items():
-            tally[term]["sentences"] += n
-            tally[term]["filings"] += 1
-    return pd.DataFrame([{"term": t, **v} for t, v in tally.items()])
+                    "total_hits": total_hits, "audit": audit, "short": short,
+                    "short_examples": short_examples,
+                    "en_counts": en_counts, "n_en": n_en, "n_em": n_em}
 
 
 # --------------------------------------------------------------------------- #
@@ -450,13 +512,18 @@ def _pull_coverage() -> dict:
 
 
 def _check_funnel(filings: pd.DataFrame, kept: pd.DataFrame, dropped: pd.DataFrame,
-                  scope_ciks: set[str]) -> None:
+                  scope_ciks: set[str], done: set[str]) -> None:
     """Reconcile the corpus end to end, asserting the arithmetic rather than only printing it.
 
     Starts at the pull rather than at the cleaned table so any silent loss between steps is
     visible in one place.
+
+    ``done`` is counted in cleaned-table ROWS, not as the size of the accession set: a joint
+    filing carried by two PERMNOs is one accession but two rows, so comparing a set size
+    against a row count would leave the identity one short and fail a correct run.
     """
     cov = _pull_coverage()
+    n_done = int(filings["accession"].isin(done).sum())
     print("Corpus funnel (every exclusion attributed):")
     for label, n in [("universe CIKs (bridge)", len(scope_ciks)),
                      ("pull log successes", cov["log_success"]),
@@ -465,12 +532,15 @@ def _check_funnel(filings: pd.DataFrame, kept: pd.DataFrame, dropped: pd.DataFra
         print(f"  {label:34s} {n:>7,}")
     for reason, n in dropped["drop_reason"].value_counts().items():
         print(f"    - dropped {reason:24s} {n:>7,}")
-    print(f"  {'= scored':34s} {len(kept):>7,}")
+    if n_done:
+        print(f"    - already scored{'':18s} {n_done:>7,}")
+    print(f"  {'= scored this run':34s} {len(kept):>7,}")
 
-    if len(kept) + len(dropped) != len(filings):
+    if len(kept) + len(dropped) + n_done != len(filings):
         raise ValueError(f"funnel does not reconcile: {len(kept):,} scored + "
-                         f"{len(dropped):,} dropped != {len(filings):,} cleaned filings")
-    print(f"  reconciles: {len(kept):,} + {len(dropped):,} = {len(filings):,}")
+                         f"{len(dropped):,} dropped + {n_done:,} already scored "
+                         f"!= {len(filings):,} cleaned filings")
+    print(f"  reconciles: {len(kept):,} + {len(dropped):,} + {n_done:,} = {len(filings):,}")
 
 
 def _check_drop_reconciliation(dropped: pd.DataFrame) -> None:
@@ -538,33 +608,19 @@ def _check_utility_context(scores: pd.DataFrame, diag: dict) -> None:
     print("  ('tariff' also denotes a regulated utility rate schedule; reported, not filtered)")
 
 
-def _check_en_dash(kept: pd.DataFrame, diag: dict) -> None:
+def _check_en_dash(diag: dict) -> None:
     """Test the en-dash term explicitly, separately from hyphen and spaced variants.
 
-    Counts accumulate per filing rather than over a concatenated corpus: joining ~1 GB of
-    text into one string to run six regex passes is pure overhead.
+    Counts are accumulated during the scoring pass (see score_stream) rather than recomputed
+    here: the text lives in the per-accession store, so a second pass would decompress the
+    whole corpus again to answer one diagnostic.
     """
-    en_term = "U.S." + EN_DASH + "China tariffs"
-    variants = [
-        ("exact, U+2013 en dash", r"U\.S\." + EN_DASH + r"China tariffs"),
-        ("hyphen variant  U.S.-China tariffs", r"U\.S\.-China tariffs"),
-        ("U.S.<any dash>China, any context", r"U\.S\." + DASH_CLASS + r"China"),
-        ("US<any dash>China, any context", r"(?<!\w)US" + DASH_CLASS + r"China"),
-        ("China tariffs, loose", r"China\s+tariffs"),
-    ]
-    compiled = [(label, re.compile(p, re.IGNORECASE)) for label, p in variants]
-    counts = {label: 0 for label, _ in variants}
-    n_en = n_em = 0
-    for r in kept.itertuples(index=False):
-        text = r.item_1a_text + "\n" + r.rest_text
-        n_en += text.count(EN_DASH)
-        n_em += text.count(EM_DASH)
-        for label, pattern in compiled:
-            counts[label] += len(pattern.findall(text))
+    counts, n_en, n_em = diag["en_counts"], diag["n_en"], diag["n_em"]
+    variants = EN_DASH_VARIANTS
 
     print("\nEn-dash diagnostic for the list term 'U.S.<U+2013>China tariffs':")
     print(f"  sentence hits recorded for the exact list term : "
-          f"{diag['term_1a'][en_term] + diag['term_rest'][en_term]:,}")
+          f"{diag['term_1a'][EN_DASH_TERM] + diag['term_rest'][EN_DASH_TERM]:,}")
     print(f"  en dashes (U+2013) present in cleaned corpus   : {n_en:,}")
     print(f"  em dashes (U+2014) present in cleaned corpus   : {n_em:,}")
     print("  raw occurrences in the cleaned corpus:")
@@ -629,12 +685,8 @@ def _check_dispersion(scores: pd.DataFrame) -> None:
     print("\n  correlation between measures:")
     corr = scores[TEXP_COLUMNS].corr().round(3).to_string()
     print("    " + corr.replace("\n", "\n    "))
-
-    z_cols = [f"{c}_z" for c in TEXP_COLUMNS]
-    print("\n  standardised columns (should be mean 0, sd 1 by construction):")
-    for col in z_cols:
-        s = scores[col].dropna()
-        print(f"    {col:18s} n={len(s):>6,} mean={s.mean():>9.2e} sd={s.std():>6.3f}")
+    print("\n  (standardisation is not checked here: a z-score belongs to one cross-section, "
+          "and\n   this table pools 17 reference dates. See build_texp_panel.py.)")
 
 
 def _check_duplicate_accessions(scores: pd.DataFrame) -> None:
@@ -675,81 +727,131 @@ def _check_spot_sentences(scores: pd.DataFrame, diag: dict) -> None:
                 print(f"      {_printable(flat)}")
 
 
-def _check_short_sentences(tokenised: list[dict]) -> None:
-    """Report implausibly short sentences, which signal tokenisation artifacts."""
+def _check_short_sentences(diag: dict) -> None:
+    """Report implausibly short sentences, which signal tokenisation artifacts.
+
+    Tallied during the scoring pass; see score_stream.
+    """
     print(f"\nSentences shorter than {MIN_SENTENCE_CHARS} chars (tokenisation artifacts):")
-    examples = []
-    for key, label in [("sentences_item1a", "item1a"), ("sentences_rest", "rest")]:
-        n_all = n_short = 0
-        for t in tokenised:
-            n_all += len(t[key])
-            short = [s for s in t[key] if len(s.strip()) < MIN_SENTENCE_CHARS]
-            n_short += len(short)
-            if len(examples) < 8:
-                examples += short[:2]
-        print(f"  {label:7s} {n_short:>9,} of {n_all:>9,} ({n_short / n_all if n_all else 0:.2%})")
+    for label, (n_all, n_short) in diag["short"].items():
+        print(f"  {label:7s} {n_short:>9,} of {n_all:>9,} "
+              f"({n_short / n_all if n_all else 0:.2%})")
     print("  examples:")
-    for s in examples[:8]:
+    for s in diag["short_examples"][:8]:
         print(f"    {_printable(repr(s.strip()))}")
 
 
 def validate(scores: pd.DataFrame, filings: pd.DataFrame, kept: pd.DataFrame,
              dropped: pd.DataFrame, scope_ciks: set[str], terms: list[str],
-             diag: dict, tokenised: list[dict], audit: pd.DataFrame) -> None:
+             diag: dict, done: set[str]) -> None:
     """Run every required check and print the report."""
     print("=" * 78)
     print("VALIDATION")
     print("=" * 78)
-    _check_funnel(filings, kept, dropped, scope_ciks)
+    _check_funnel(filings, kept, dropped, scope_ciks, done)
     _check_drop_reconciliation(dropped)
     _check_composition(scores)
     _check_per_term(terms, diag, len(scores))
-    _check_removed_terms(audit, diag["total_hits"])
+    _check_removed_terms(diag["audit"], diag["total_hits"])
     _check_utility_context(scores, diag)
-    _check_en_dash(kept, diag)
+    _check_en_dash(diag)
     _check_distributions(scores)
     _check_dispersion(scores)
     _check_duplicate_accessions(scores)
     _check_spot_sentences(scores, diag)
-    _check_short_sentences(tokenised)
+    _check_short_sentences(diag)
 
 
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                     #
 # --------------------------------------------------------------------------- #
-def main() -> pd.DataFrame:
+def scored_accessions() -> set[str]:
+    """Accessions already present in tariff_scores.csv."""
+    if not SCORES_OUT.exists() or SCORES_OUT.stat().st_size == 0:
+        return set()
+    return set(pd.read_csv(SCORES_OUT, dtype={"accession": str})["accession"].dropna())
+
+
+def align_scores_schema() -> list[str]:
+    """Drop the pooled TExp_*_z columns from a pre-existing tariff_scores.csv, once.
+
+    New rows are appended with the current fieldnames, so a stale header would silently
+    misalign every subsequent row. Only the derived standardised columns are removed - they
+    were pooled over a single reference date, are meaningless once the file spans 17, and
+    nothing downstream reads them (decile_sort, foreign_sales and run_car_regression all use
+    raw TExp_item1a). The raw scores are re-read afterwards and compared element-wise, so a
+    run aborts rather than proceeding on a file whose values moved.
+    """
+    if not SCORES_OUT.exists() or SCORES_OUT.stat().st_size == 0:
+        return []
+    existing = pd.read_csv(SCORES_OUT, dtype={"cik": str, "accession": str})
+    stale = [c for c in existing.columns if c not in OUTPUT_COLUMNS]
+    if not stale:
+        return []
+
+    trimmed = existing.reindex(columns=OUTPUT_COLUMNS)
+    trimmed.to_csv(SCORES_OUT, index=False)
+    back = pd.read_csv(SCORES_OUT, dtype={"cik": str, "accession": str})
+    if len(back) != len(existing):
+        raise ValueError(f"schema alignment changed the row count: {len(existing):,} -> "
+                         f"{len(back):,}")
+    for col in TEXP_COLUMNS:
+        if not back[col].equals(existing[col]):
+            raise ValueError(f"schema alignment altered {col}; aborting with the file as read.")
+    return stale
+
+
+def main() -> pd.DataFrame | None:
     ap = argparse.ArgumentParser(description="Tariff-exposure tokenisation and scoring.")
     ap.add_argument("--n-ciks", type=int, default=None,
                     help="restrict to the first N distinct CIKs by PERMNO "
                          "(default: the whole universe)")
+    ap.add_argument("--status", action="store_true",
+                    help="report done/remaining and exit without scoring anything")
     args = ap.parse_args()
+
+    filings = clean_filings.read_clean_filings()   # raises if the upstream step has not run
+    scope_ciks = resolve_scope_ciks(args.n_ciks)
+    done = scored_accessions()
+    kept, dropped = load_scope(filings, scope_ciks, done)
+    print(f"Scope: {'whole universe' if args.n_ciks is None else f'first {args.n_ciks} CIKs'} "
+          f"-> {len(scope_ciks):,} CIKs | {len(filings):,} cleaned filings | "
+          f"already scored {len(done):,} | to score {len(kept):,} | dropped {len(dropped):,}")
+    if args.status:
+        print(dropped["drop_reason"].value_counts().to_string())
+        return None
+    if kept.empty:
+        print("Nothing to score.")
+        return None
+
+    dropped_cols = align_scores_schema()
+    if dropped_cols:
+        print(f"Removed stale pooled column(s) from {SCORES_OUT.name}: "
+              f"{', '.join(dropped_cols)} (raw scores verified unchanged).")
 
     resource = ensure_punkt()
     terms = load_bigrams(BIGRAM_JSON)
     patterns, gates = compile_patterns(terms), build_gates(terms)
-    print(f"Tokenizer data: NLTK '{resource}' | terms: {len(terms)} "
-          f"from {BIGRAM_JSON.name} | fiscal years: {FISCAL_YEARS}\n")
+    print(f"Tokenizer data: NLTK '{resource}' | terms: {len(terms)} from {BIGRAM_JSON.name}\n")
+    edgar_pull._prevent_sleep()
 
-    filings = clean_filings.read_clean_filings()   # raises if the upstream step has not run
-    scope_ciks = resolve_scope_ciks(args.n_ciks)
-    kept, dropped = load_scope(filings, scope_ciks)
-    print(f"Scope: {'whole universe' if args.n_ciks is None else f'first {args.n_ciks} CIKs'} "
-          f"-> {len(scope_ciks):,} CIKs | {len(filings):,} cleaned filings -> "
-          f"{len(kept):,} to score, {len(dropped):,} dropped.\n")
+    fh, writer = open_scores_log()
+    try:
+        scores, diag = score_stream(kept, patterns, gates, writer, fh)
+    finally:
+        fh.close()
 
-    tokenised = tokenise_sections(kept)
-    scores, diag = score_filings(tokenised, patterns, gates)
-    audit = audit_removed_terms(tokenised)
-
-    CLEAN_DIR.mkdir(exist_ok=True)
-    scores.to_csv(SCORES_OUT, index=False)
-    print(f"Wrote {SCORES_OUT.relative_to(BASE)} "
-          f"({len(scores):,} rows x {len(scores.columns)} cols).")
-    write_diagnostics(scores, dropped)
+    full = pd.read_csv(SCORES_OUT, dtype={"cik": str, "accession": str})
+    print(f"Wrote {SCORES_OUT.relative_to(BASE)} (+{len(scores):,} rows this run, "
+          f"{len(full):,} total x {len(full.columns)} cols).")
+    write_diagnostics(full, dropped)
     write_term_hits(terms, diag)
     print()
 
-    validate(scores, filings, kept, dropped, scope_ciks, terms, diag, tokenised, audit)
+    # Validated on this run's rows, not the whole file: the diag counters describe exactly
+    # these filings, and pairing them with a corpus-wide row count would misstate every
+    # per-term and per-filing rate on a resumed run.
+    validate(scores, filings, kept, dropped, scope_ciks, terms, diag, done)
     return scores
 
 

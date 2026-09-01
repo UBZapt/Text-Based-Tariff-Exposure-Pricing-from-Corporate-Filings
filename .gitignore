@@ -31,6 +31,7 @@ filings_raw/
 # --- Internal methodology & project instructions (not for publication) ---
 CLAUDE.md
 Tariff_Factor_Research_Design_v*.md
+Research_Design_v6_revised_sections.md
 build_notes.md
 
 # --- Credentials & secrets: use environment variables / a local .env instead ---
@@ -290,3 +291,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+submissions_cache/
+clean_text/

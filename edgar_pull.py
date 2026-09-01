@@ -1,11 +1,22 @@
 """
 Part B — SEC EDGAR 10-K retrieval (gap-only pull).
 
-Takes the firm universe from clean_firm_bridge.csv, resolves one CIK per firm at
-the reference date, queries the SEC submissions API for each firm's filing
-history, selects the most recent 10-K filed strictly before the reference date
-(within a staleness window), downloads and caches the primary HTML document, and
-logs the per-firm outcome (or the specific reason no filing was retrieved).
+Takes the firm list for the requested scope, resolves one CIK per firm at the
+reference date, queries the SEC submissions API for each firm's filing history,
+selects the most recent 10-K filed strictly before the reference date (within a
+staleness window), downloads and caches the primary HTML document, and logs the
+per-firm outcome (or the specific reason no filing was retrieved).
+
+Two scopes and two named multi-date batches (Step 1e):
+
+    --scope full       clean_firm_bridge.csv, the default and unchanged
+    --scope subsample  output/full_panel_firm_sample.csv, the fixed 1,000-firm draw
+    --batch cross_cycle  9 Section 301 event dates, 2018-2020, at scope full   (7.6)
+    --batch full_panel   9 annual dates, 2017-2025, at scope subsample         (7.4/7.5)
+
+Whatever the scope, the CIK for each PERMNO is still resolved against the bridge per
+(PERMNO, reference_date): the persisted lists supply which firms to pull, never their
+identifiers. Cache retention is likewise always decided against the bridge.
 
 The pull is incremental and resumable: the work list is the scope CIKs MINUS every
 CIK already complete at this reference date (pulled successfully, or failed for a
@@ -18,7 +29,11 @@ universe are pruned. No text parsing, tokenization, or scoring is performed here
 
     python edgar_pull.py --all                  # full universe (hours; run in background)
     python edgar_pull.py --status               # coverage report; no network calls
-    python edgar_pull.py [--n-ciks 50] [--reference-date 2025-04-02] [--retry-all]
+    python edgar_pull.py --status --batch cross_cycle      # per-date coverage matrix
+    python edgar_pull.py --batch cross_cycle               # download-bound; run in background
+    python edgar_pull.py --batch full_panel                # run cross_cycle first: it caches
+                                                          # nearly all the 1,001 CIKs it needs
+    python edgar_pull.py [--n-ciks 50] [--reference-date 2025-04-02] [--scope full] [--retry-all]
 
 IMPORTANT: set a real name/email via the EDGAR_USER_AGENT environment variable (or a
 gitignored .env file) before any run - the SEC fair-access policy requires a genuine
@@ -28,6 +43,8 @@ contact. If unset, a non-functional placeholder is used and a warning is printed
 import argparse
 import csv
 import ctypes
+import gzip
+import json
 import os
 import random
 import sys
@@ -59,8 +76,12 @@ def _load_dotenv(path: Path) -> None:
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
 CLEAN_DIR = BASE / "clean_data"
+OUTPUT_DIR = BASE / "output"
 BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
 FILINGS_DIR = BASE / "filings_raw"
+# Gzipped submissions JSON, one file per CIK. The submissions history is identical for
+# every reference date, so one fetch serves a whole multi-date batch (see get_submissions).
+SUBMISSIONS_DIR = BASE / "submissions_cache"
 # The pull log is resumable pull state paired with FILINGS_DIR, not an analysis output, so it
 # stays beside the cache: if it cannot be found, every CIK reads as incomplete and re-pulls.
 LOG_CSV = BASE / "edgar_pull_log.csv"
@@ -77,7 +98,7 @@ USER_AGENT_IS_PLACEHOLDER = USER_AGENT == _PLACEHOLDER_UA
 REFERENCE_DATE = pd.Timestamp("2025-04-02")  # "Liberation Day" tariffs
 STALENESS_DAYS = 364                          # filing_date >= ref - 364 days
 N_CIKS = 50                                   # unique CIKs to cover this run
-REQUEST_SLEEP = 0.15                          # seconds between requests (<10 req/s)
+REQUEST_SLEEP = 0.15                          # min seconds between requests; 6.7/s < SEC's 10/s
 TIMEOUT = 60
 
 MAX_RETRIES = 4               # HTTP attempts per request before the firm is failed
@@ -104,6 +125,35 @@ LOG_BACKUP = LOG_CSV.with_name("edgar_pull_log.pre-migration.csv")
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:0>10}.json"
 ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{doc}"
 
+# --- Firm-list sourcing and multi-date batches (Step 1e) ------------------- #
+# Written by persist_2025_universe.py and sample_full_panel_firms.py. Read here directly rather
+# than by import: those modules import this one, so importing back would be circular.
+UNIVERSE_CSV = OUTPUT_DIR / "event_study_firm_universe.csv"   # 2025 event-study universe (audit)
+SAMPLE_CSV = OUTPUT_DIR / "full_panel_firm_sample.csv"        # fixed 1,000-firm draw, section 7.0
+
+# Pull scopes. 'full' is the bridge, unchanged from every previous run: the bridge is
+# ever-qualifying across 2017-2026 while the persisted universe is point-in-time at end-March
+# 2025, and filtering a 2018 event pull through a 2025 screen would impose a survivorship
+# filter the design does not ask for (section 7.2 screens point-in-time at each event).
+# 'subsample' restricts to the persisted draw, for the annual full-panel refresh only.
+SCOPES = {"full": None, "subsample": SAMPLE_CSV}
+
+# Annual full-panel refresh, section 7.0. April 2 each year, so 2025-04-02 is a member and is
+# already complete - completed_ciks() skips it with no special-casing. With the 364-day window a
+# December-FY firm gets its FY(y-1) 10-K filed in Feb/Mar of year y.
+FULL_PANEL_DATES = [f"{year}-04-02" for year in range(2017, 2026)]
+
+# Cross-cycle event pull, section 7.6. Seven Section 301 escalations from Bruno, Goltz & Luyten
+# (2024) Table 3, used exactly as published so the event-date selection carries no discretion,
+# plus the two reversal dates: 2019-10-11 (primary) and 2020-01-15 (Phase One, robustness).
+CROSS_CYCLE_DATES = ["2018-03-01", "2018-03-22", "2018-04-02", "2018-06-15", "2018-09-17",
+                     "2019-05-10", "2019-08-23", "2019-10-11", "2020-01-15"]
+
+# 2018-04-02 is in both lists. Run cross_cycle first: it covers that date at bridge scope, which
+# makes it free for full_panel, since completion is keyed on (CIK, reference_date) not on scope.
+BATCHES = {"full_panel": (FULL_PANEL_DATES, "subsample"),
+           "cross_cycle": (CROSS_CYCLE_DATES, "full")}
+
 _SESSION: requests.Session | None = None
 
 
@@ -128,6 +178,24 @@ def _session() -> requests.Session:
     return _SESSION
 
 
+_last_request = 0.0
+
+
+def _throttle() -> None:
+    """Block until at least REQUEST_SLEEP has passed since the previous request.
+
+    Enforced here rather than by the caller so the floor holds per *request*: retries
+    inside _get are spaced too, and firms answered from a cache without issuing a
+    request cost nothing. Caps the run at 1/REQUEST_SLEEP req/s against SEC's 10/s
+    fair-access limit, for every code path, present and future.
+    """
+    global _last_request
+    wait = REQUEST_SLEEP - (time.monotonic() - _last_request)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request = time.monotonic()
+
+
 def _get(url: str) -> requests.Response:
     """GET with exponential backoff on transient errors.
 
@@ -140,6 +208,7 @@ def _get(url: str) -> requests.Response:
     last: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
+            _throttle()
             r = _session().get(url, timeout=TIMEOUT)
             if r.status_code == 403:
                 raise SecBlocked(url)
@@ -200,14 +269,73 @@ def resolve_firms(bridge_csv: Path, ref: pd.Timestamp) -> list[dict]:
     """
     bridge = pd.read_csv(bridge_csv, dtype=str)
     bridge["_permno"] = bridge["permno"].astype(int)
-    firms = []
-    for permno, group in bridge.groupby("_permno", sort=True):
-        row = _resolve_cik(group, ref)
-        firms.append({
-            "permno": int(permno),
-            "gvkey": row["gvkey"],
-            "cik": (row["cik"] if isinstance(row["cik"], str) else "").strip(),
-        })
+
+    # 97% of PERMNOs hold exactly one bridge row, where _resolve_cik has no choice to make and
+    # returns that row whatever the reference date. Splitting them out cuts a groupby-apply over
+    # 4,291 groups to one over ~120 (5.8 s -> 0.2 s), which matters because --status resolves
+    # once per batch date. _resolve_cik itself is unchanged and still decides every real tie.
+    n_rows = bridge["_permno"].map(bridge["_permno"].value_counts())
+    chosen = {int(r["_permno"]): r
+              for _, r in bridge[n_rows.eq(1)].iterrows()}
+    for permno, group in bridge[n_rows.gt(1)].groupby("_permno"):
+        chosen[int(permno)] = _resolve_cik(group, ref)
+
+    return [{"permno": permno,
+             "gvkey": chosen[permno]["gvkey"],
+             "cik": (chosen[permno]["cik"] if isinstance(chosen[permno]["cik"], str)
+                     else "").strip()}
+            for permno in sorted(chosen)]
+
+
+def bridge_ciks(bridge_csv: Path = BRIDGE_CSV) -> set[str]:
+    """Every CIK appearing anywhere in the bridge, independent of any reference date.
+
+    This is the cache-retention set, and it must NOT be the date-resolved universe that
+    resolve_firms returns: _resolve_cik picks one link row per PERMNO according to which
+    interval covers the reference date, so the resolved CIK set shifts with the date (4,230 at
+    2025-04-02, 4,190 at 2019-10-11). Pruning against a date-resolved set therefore deletes
+    filings pulled at a different date - harmless while 2025-04-02 was the only date in use,
+    but destructive as soon as the cache spans several. filings_raw/ spans every reference
+    date, so retention has to as well.
+    """
+    cik = pd.read_csv(bridge_csv, dtype=str, usecols=["cik"])["cik"].fillna("")
+    return {c.strip().zfill(10) for c in cik if c.strip()}
+
+
+def read_firm_list(path: Path) -> list[int]:
+    """Read a persisted PERMNO list (universe or subsample), skipping provenance comments.
+
+    ``comment='#'`` is required for the sample file, whose header carries the recorded seed
+    and draw date. Raises rather than falling back to the bridge: a silently wider pull would
+    cost hours of SEC requests before anyone noticed.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path.name} not found. Run persist_2025_universe.py, then "
+            f"sample_full_panel_firms.py, before pulling at this scope.")
+    frame = pd.read_csv(path, dtype=str, comment="#")
+    return sorted(int(p) for p in frame["permno"])
+
+
+def scope_firms(scope: str, bridge_firms: list[dict]) -> list[dict]:
+    """Restrict an already-resolved bridge firm list to the requested scope.
+
+    'full' returns it unchanged, so the default scope is byte-identical to every previous run.
+    'subsample' keeps only the persisted 1,000-firm draw. The CIK is never read from the
+    persisted file - it is resolved by _resolve_cik per (PERMNO, reference_date) in
+    resolve_firms, so a link that changed between reference dates resolves correctly at each.
+    """
+    if scope not in SCOPES:
+        raise ValueError(f"unknown scope {scope!r}; expected one of {sorted(SCOPES)}.")
+    path = SCOPES[scope]
+    if path is None:
+        return bridge_firms
+    keep = set(read_firm_list(path))
+    firms = [f for f in bridge_firms if f["permno"] in keep]
+    missing = keep - {f["permno"] for f in firms}
+    if missing:
+        print(f"!! {len(missing)} PERMNO(s) in {path.name} are absent from "
+              f"{BRIDGE_CSV.name} and cannot be pulled: {sorted(missing)[:10]}")
     return firms
 
 
@@ -236,9 +364,34 @@ def select_gap_firms(firms: list[dict], done: set[str],
 # --------------------------------------------------------------------------- #
 # SEC access                                                                   #
 # --------------------------------------------------------------------------- #
-def get_submissions(cik: str) -> dict:
-    """Fetch a firm's submission history from the SEC submissions API."""
-    return _get(SUBMISSIONS_URL.format(cik=cik)).json()
+def get_submissions(cik: str, ref: pd.Timestamp) -> dict:
+    """Return a firm's submission history, reusing a cached copy when valid for ref.
+
+    The submissions file is an append-only filing history and does not depend on the
+    reference date, so one fetch serves an entire multi-date batch. A cached copy is
+    valid for ref only if it was fetched at or after ref, since everything filed up to
+    ref-1 is then already present; otherwise it is refetched and the newer copy - valid
+    for that ref and every earlier one - replaces it. Which 10-K gets selected is
+    unaffected: select_10k computes that locally from whichever copy is used.
+    """
+    path = SUBMISSIONS_DIR / f"CIK{int(cik):010d}.json.gz"
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if pd.Timestamp(cached["fetched_at"]) >= ref:
+            return cached["submissions"]
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError):
+        path.unlink(missing_ok=True)      # truncated, corrupt or written by an older format
+
+    subs = _get(SUBMISSIONS_URL.format(cik=cik)).json()
+    SUBMISSIONS_DIR.mkdir(exist_ok=True)
+    tmp = path.with_suffix(".part")
+    with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+        json.dump({"fetched_at": pd.Timestamp.now().isoformat(), "submissions": subs}, fh)
+    _replace_with_retry(tmp, path)
+    return subs
 
 
 def select_10k(submissions: dict, ref: pd.Timestamp) -> tuple[dict | None, str]:
@@ -462,8 +615,7 @@ def _pull_one(f: dict, ref: pd.Timestamp) -> dict:
         return rec
 
     try:
-        subs = get_submissions(f["cik"])
-        time.sleep(REQUEST_SLEEP)
+        subs = get_submissions(f["cik"], ref)
     except SecBlocked:
         raise
     except Exception as e:  # network / HTTP / JSON
@@ -480,7 +632,6 @@ def _pull_one(f: dict, ref: pd.Timestamp) -> dict:
     try:
         path = download_primary(f["permno"], f["cik"], sel["accession"],
                                 sel["primary_document"])
-        time.sleep(REQUEST_SLEEP)
     except SecBlocked:
         raise
     except Exception as e:
@@ -560,15 +711,15 @@ def _pull_firms(firms: list[dict], ref: pd.Timestamp, writer, fh) -> dict:
 
 
 def pull_gap(n_ciks: int | None, ref: pd.Timestamp,
-             retry_all: bool = False) -> pd.DataFrame:
-    """Pull only the universe CIKs not already complete at this reference date.
+             retry_all: bool = False, scope: str = "full") -> pd.DataFrame:
+    """Pull only the scope CIKs not already complete at this reference date.
 
-    Scope is the first ``n_ciks`` distinct CIKs of the rebuilt bridge universe in
-    PERMNO order (``None`` = the whole universe), less every CIK already complete
-    (see completed_ciks). Cached
-    filings for firms that have left the universe are pruned and .part files from an
-    interrupted run are cleared first. The log is written row-by-row, so an
-    interruption at any point leaves a resumable state.
+    Scope is the first ``n_ciks`` distinct CIKs of the requested firm list in PERMNO order
+    (``None`` = the whole list), less every CIK already complete (see completed_ciks).
+    ``scope='full'`` is the rebuilt bridge, unchanged from every previous run; 'subsample' is
+    the persisted 1,000-firm draw. Cached filings for firms that have left the *bridge* are
+    pruned and .part files from an interrupted run are cleared first. The log is written
+    row-by-row, so an interruption at any point leaves a resumable state.
     """
     FILINGS_DIR.mkdir(exist_ok=True)
     _prevent_sleep()
@@ -577,7 +728,14 @@ def pull_gap(n_ciks: int | None, ref: pd.Timestamp,
               "before any non-pilot run (SEC fair-access requirement).")
     migrate_log()
 
-    firms = resolve_firms(BRIDGE_CSV, ref)
+    bridge_firms = resolve_firms(BRIDGE_CSV, ref)
+    firms = scope_firms(scope, bridge_firms)
+    # Retention is decided against the whole bridge and independently of this reference date -
+    # never the active scope, and never the date-resolved universe (see bridge_ciks).
+    # filings_raw/ is a cache of the bridge across every reference date; pruning against a
+    # narrower or date-specific set would delete filings the full-universe scoring and the
+    # section 8 unscreened cross-section depend on.
+    retain_ciks = bridge_ciks()
     universe_ciks = {f["cik"] for f in firms if f["cik"]}
     log = load_log()
     done = completed_ciks(log, ref, retry_all)
@@ -585,21 +743,22 @@ def pull_gap(n_ciks: int | None, ref: pd.Timestamp,
     attempted = {c.strip().zfill(10) for c in log["cik"]} if not log.empty else set()
     n_retry = len([f for f in todo if f["cik"] and f["cik"] in attempted])
 
-    print(f"Universe ({BRIDGE_CSV.name}): {len(firms):,} PERMNOs, "
+    source = BRIDGE_CSV.name if SCOPES[scope] is None else SCOPES[scope].name
+    print(f"Scope '{scope}' ({source}): {len(firms):,} PERMNOs, "
           f"{len(universe_ciks):,} unique CIKs.")
     print(f"Already complete at {ref.date()}: {len(done):,} CIKs "
-          f"({len(done & universe_ciks):,} still in universe, "
-          f"{len(done - universe_ciks):,} no longer)"
+          f"({len(done & universe_ciks):,} still in scope, "
+          f"{len(done - universe_ciks):,} not)"
           f"{' [--retry-all: successes only]' if retry_all else ''}.")
-    scope = "whole universe" if n_ciks is None else f"first {n_ciks:,} unique CIKs by PERMNO"
-    print(f"Scope: {scope} -> {n_skipped:,} already done "
+    limit = "whole scope" if n_ciks is None else f"first {n_ciks:,} unique CIKs by PERMNO"
+    print(f"Work list: {limit} -> {n_skipped:,} already done "
           f"(not re-pulled), {len(todo):,} to pull "
           f"({n_retry:,} previously-failed retries, {len(todo) - n_retry:,} new).")
 
     n_part = clear_partials()
-    removed = prune_stale(log, universe_ciks)
+    removed = prune_stale(log, retain_ciks)
     print(f"Cleared {n_part} partial download(s); pruned {len(removed)} cached "
-          f"filing(s) no longer in the universe.\n")
+          f"filing(s) no longer in the bridge.\n")
 
     fh, writer = open_log()
     try:
@@ -608,6 +767,104 @@ def pull_gap(n_ciks: int | None, ref: pd.Timestamp,
     finally:
         fh.close()
     return load_log()
+
+
+def missing_cached_files(log: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Successful log rows whose cached file is gone, split by whether it should come back.
+
+    Returns (repairable, expected). A row is *expected* to be missing when its CIK has left
+    the bridge: prune_stale deleted the file on purpose and re-downloading it would only have
+    the next pull delete it again. Only in-bridge rows are repairable. print_status has always
+    reported the combined count; the split is what makes it actionable.
+    """
+    empty = log.iloc[0:0]
+    if log.empty:
+        return empty, empty
+    ok = log[_succeeded(log)]
+    gone = [bool(str(r.local_path).strip()) and not _cached_path(r.local_path).exists()
+            for r in ok.itertuples(index=False)]
+    missing = ok[pd.Series(gone, index=ok.index)]
+    if missing.empty:
+        return empty, empty
+    retain = bridge_ciks()
+    in_bridge = missing["cik"].str.strip().str.zfill(10).isin(retain)
+    return missing[in_bridge], missing[~in_bridge]
+
+
+def restore_missing(dry_run: bool = False) -> pd.DataFrame:
+    """Re-download cached filings that a successful log row points at but disk no longer holds.
+
+    Runs the ordinary per-firm path at each row's own reference date, so select_10k is
+    deterministic and resolves to the same accession and the same cached filename. Firms are
+    de-duplicated on (cik, reference_date). The log stays append-only: the repair adds a fresh
+    row rather than editing the original, matching how a retried failure is already recorded.
+    """
+    migrate_log()
+    log = load_log()
+    missing, expected = missing_cached_files(log)
+    print("=" * 70)
+    print("RESTORE MISSING CACHED FILINGS")
+    print("=" * 70)
+    if not expected.empty:
+        print(f"Skipping {len(expected):,} row(s) whose CIK has left the bridge "
+              f"({expected['cik'].nunique():,} firm(s)): prune_stale deleted those files "
+              f"deliberately,\n  and re-downloading them would only have the next pull delete "
+              f"them again.")
+    if missing.empty:
+        print("Nothing to restore: every repairable success has its file on disk.")
+        return log
+
+    by_ref: dict[str, list[dict]] = {}
+    for ref_date, group in missing.groupby("reference_date"):
+        seen, firms = set(), []
+        for r in group.itertuples(index=False):
+            key = r.cik.strip().zfill(10)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            firms.append({"permno": int(r.permno), "gvkey": r.gvkey, "cik": r.cik.strip()})
+        by_ref[ref_date] = firms
+        print(f"  {ref_date}: {len(group):,} missing row(s) -> {len(firms):,} firm(s) to refetch")
+
+    if dry_run:
+        print("\n--dry-run: nothing fetched. Re-run without it to restore.")
+        return log
+
+    FILINGS_DIR.mkdir(exist_ok=True)
+    _prevent_sleep()
+    clear_partials()
+    fh, writer = open_log()
+    try:
+        for ref_date, firms in by_ref.items():
+            print(f"\nRestoring {len(firms):,} firm(s) at {ref_date} ...")
+            counts = _pull_firms(firms, pd.Timestamp(ref_date), writer, fh)
+            print(f"  {counts['ok']:,} restored, {counts['failed']:,} failed.")
+    finally:
+        fh.close()
+    still, still_expected = missing_cached_files(load_log())
+    print(f"\nStill missing after restore: {len(still):,} repairable, "
+          f"{len(still_expected):,} expected (out of bridge).")
+    return load_log()
+
+
+def run_batch(name: str, retry_all: bool = False) -> pd.DataFrame:
+    """Run one named batch's reference dates in sequence, in this process.
+
+    Each date is an ordinary pull_gap call, so completion, caching and resumption behave
+    exactly as for a single-date run: nothing already complete at a (CIK, reference_date) pair
+    is re-pulled and nothing already cached under an accession is re-downloaded. PullAborted
+    propagates rather than being swallowed - a 403 storm should stop the batch, not push on
+    into SEC's throttle - and re-running the identical command resumes from the log.
+    """
+    dates, scope = BATCHES[name]
+    log = load_log()
+    for i, date in enumerate(dates, start=1):
+        print(f"\n{'=' * 70}\nBATCH {name}  [{i}/{len(dates)}]  "
+              f"reference_date={date}  scope={scope}\n{'=' * 70}")
+        log = pull_gap(None, pd.Timestamp(date), retry_all, scope)
+    print(f"\n{'=' * 70}\nBATCH {name} COMPLETE: {len(dates)} reference date(s) at "
+          f"scope '{scope}'.\n{'=' * 70}")
+    return log
 
 
 # --------------------------------------------------------------------------- #
@@ -645,11 +902,49 @@ def validate(log: pd.DataFrame) -> None:
         print("\nNo successful downloads to spot-check.")
 
 
-def print_status(ref: pd.Timestamp) -> None:
+def _firm_list_sizes() -> dict[str, int | None]:
+    """PERMNO counts of the two persisted firm lists; None where a file is absent."""
+    sizes = {}
+    for path in (UNIVERSE_CSV, SAMPLE_CSV):
+        try:
+            sizes[path.name] = len(read_firm_list(path))
+        except FileNotFoundError:
+            sizes[path.name] = None
+    return sizes
+
+
+def print_coverage_matrix(dates: list[str], scope: str, log: pd.DataFrame) -> None:
+    """Print complete/remaining per reference date at one scope, from the log alone.
+
+    Scope membership is derived from the persisted lists, so the log schema is unchanged - it
+    carries no scope column and does not need one. A CIK is counted complete if it is complete
+    at that reference date under ANY scope, since completion is keyed on (CIK, reference_date):
+    a date already covered by a wider scope is genuinely done for a narrower one.
+    """
+    print(f"\n  scope '{scope}'")
+    print(f"  {'reference_date':<16}{'scope CIKs':>12}{'complete':>11}{'remaining':>11}"
+          f"{'pct':>8}   outcomes at this date")
+    print("  " + "-" * 96)
+    for date in dates:
+        ref = pd.Timestamp(date)
+        firms = scope_firms(scope, resolve_firms(BRIDGE_CSV, ref))
+        ciks = {f["cik"] for f in firms if f["cik"]}
+        done = completed_ciks(log, ref) & ciks
+        same_ref = log[log["reference_date"] == date] if not log.empty else log
+        outcomes = ""
+        if len(same_ref):
+            counts = same_ref["fail_reason"].replace("", "ok").value_counts()
+            outcomes = "  ".join(f"{r}={n:,}" for r, n in counts.head(4).items())
+        print(f"  {date:<16}{len(ciks):>12,}{len(done):>11,}{len(ciks - done):>11,}"
+              f"{len(done) / max(len(ciks), 1):>8.1%}   {outcomes}")
+
+
+def print_status(ref: pd.Timestamp, batch: str | None = None) -> None:
     """Report pull coverage from the log and disk only — no network calls.
 
     Safe to run while a pull is in flight: the log is appended row-by-row, so the
-    counts are current as of the last completed firm.
+    counts are current as of the last completed firm. ``batch`` adds the per-date
+    coverage matrix for that batch's reference dates.
     """
     migrate_log()
     firms = resolve_firms(BRIDGE_CSV, ref)
@@ -673,12 +968,38 @@ def print_status(ref: pd.Timestamp) -> None:
             print(f"  {reason:24s} {n:,}")
     print(f"Cached files           : {len(files):,} ({size / 1024 ** 3:.2f} GB)")
 
+    # Persisted firm lists, reported beside the coverage so a mismatch between the two is
+    # visible here rather than discovered downstream.
+    print("\nPersisted firm lists:")
+    print(f"  {BRIDGE_CSV.name:<32} {len(firms):>7,} PERMNOs  {len(universe):>6,} CIKs  "
+          f"(scope 'full')")
+    for name, n in _firm_list_sizes().items():
+        scope_of = "scope 'subsample'" if name == SAMPLE_CSV.name else "draw pool / audit"
+        print(f"  {name:<32} {'absent' if n is None else format(n, ',') + ' PERMNOs':>7}"
+              f"{'':>17}  {scope_of}")
+    sizes = _firm_list_sizes()
+    n_uni, n_sam = sizes[UNIVERSE_CSV.name], sizes[SAMPLE_CSV.name]
+    if n_uni is not None and n_sam is not None:
+        try:
+            nested = set(read_firm_list(SAMPLE_CSV)) <= set(read_firm_list(UNIVERSE_CSV))
+        except FileNotFoundError:
+            nested = False
+        print(f"  sample subset of universe: {nested}"
+              f"{'' if nested else '   !! MISMATCH - redraw from the current universe'}")
+
+    if batch:
+        dates, scope = BATCHES[batch]
+        print(f"\n{'=' * 70}\nBATCH COVERAGE: {batch}\n{'=' * 70}")
+        print_coverage_matrix(dates, scope, log)
+
     if len(log):
-        ok = log[_succeeded(log)]
-        missing = [r.local_path for r in ok.itertuples(index=False)
-                   if str(r.local_path).strip() and not _cached_path(r.local_path).exists()]
-        print(f"Successes missing file : {len(missing):,} "
-              f"(expected for pruned out-of-universe firms)")
+        repairable, expected = missing_cached_files(log)
+        print(f"Successes missing file : {len(repairable) + len(expected):,}")
+        print(f"  out of bridge        : {len(expected):,} "
+              f"({expected['cik'].nunique() if len(expected) else 0:,} firm(s)) - expected, "
+              f"pruned on purpose")
+        print(f"  repairable           : {len(repairable):,}"
+              f"{'  -> --restore-missing' if len(repairable) else ''}")
     parts = list(FILINGS_DIR.glob("*.part"))
     if parts:
         print(f"Orphan .part files     : {len(parts)} (cleared on the next run)")
@@ -687,16 +1008,32 @@ def print_status(ref: pd.Timestamp) -> None:
         print(f"!! Suspiciously small files: {len(truncated)} {truncated[:5]}")
 
 
-def print_assumptions(n_ciks: int | None, ref: pd.Timestamp) -> None:
+def print_assumptions(n_ciks: int | None, ref: pd.Timestamp, scope: str = "full",
+                      batch: str | None = None) -> None:
     """Print the assumptions that governed this run."""
     print("\n" + "=" * 70)
     print("ASSUMPTIONS (this run)")
     print("=" * 70)
     for line in [
-        f"Firm universe = {BRIDGE_CSV.name}, rebuilt after the NYSE micro-cap drop.",
-        ("Scope = the whole universe." if n_ciks is None else
-         f"Scope = the first {n_ciks:,} distinct CIKs in ascending PERMNO order "
-         "(same ordering as the original pilot); --all covers the whole universe."),
+        (f"Scope '{scope}' = {BRIDGE_CSV.name}, rebuilt after the NYSE micro-cap drop. This is "
+         "the firm list every previous run used and it is unchanged."
+         if SCOPES[scope] is None else
+         f"Scope '{scope}' = {SCOPES[scope].name}, the fixed random 1,000-firm draw "
+         "(Research Design v6 section 7.0, seed recorded in that file's header). The draw is "
+         "made once and reused unchanged across every annual reference date."),
+        "Firm-list sourcing: the persisted list supplies WHICH PERMNOs to pull; the CIK for "
+        "each is still resolved by _resolve_cik against the bridge once per "
+        "(PERMNO, reference_date), so a link that changed between dates resolves correctly at "
+        "each date rather than being frozen from the file.",
+        (f"Batch = {batch}: {len(BATCHES[batch][0])} reference date(s) run in sequence in one "
+         f"process, each an ordinary gap-only pull." if batch else
+         f"Single reference date {ref.date()}."),
+        ("Cache retention (prune_stale) is decided against the BRIDGE, never the active scope. "
+         "filings_raw/ is a cache of the bridge; pruning against a narrower scope would delete "
+         "filings the full-universe scoring and the section 8 unscreened cross-section need."),
+        ("Scope = the whole list." if n_ciks is None else
+         f"Work list capped at the first {n_ciks:,} distinct CIKs in ascending PERMNO order "
+         "(same ordering as the original pilot); --all covers the whole list."),
         "Work list = scope CIKs MINUS CIKs already complete at this reference date. "
         "Complete = pulled successfully, or failed structurally (no_cik / no_10k_on_file "
         "/ no_10k_in_window), which a retry cannot change while the reference date is "
@@ -740,22 +1077,53 @@ def main() -> None:
     ap.add_argument("--retry-all", action="store_true",
                     help="also retry structural failures, not just transient ones")
     ap.add_argument("--reference-date", type=str, default=str(REFERENCE_DATE.date()))
+    ap.add_argument("--scope", choices=sorted(SCOPES), default="full",
+                    help="firm list: full = the bridge (default, unchanged); "
+                         "subsample = the persisted 1,000-firm draw")
+    ap.add_argument("--batch", choices=sorted(BATCHES), default=None,
+                    help="run a named batch's reference dates in sequence at its own scope")
+    ap.add_argument("--restore-missing", action="store_true",
+                    help="re-download cached filings a successful log row points at but disk "
+                         "no longer holds (the 'Successes missing file' count in --status)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --restore-missing: report what would be fetched, fetch nothing")
     args = ap.parse_args()
     ref = pd.Timestamp(args.reference_date)
 
     if args.status:
-        print_status(ref)
+        print_status(ref, args.batch)
+        return
+
+    if args.restore_missing:
+        try:
+            restore_missing(args.dry_run)
+        except PullAborted as exc:
+            print(f"\n!! ABORTED: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.batch:
+        dates, scope = BATCHES[args.batch]   # a batch always covers its whole scope
+        try:
+            log = run_batch(args.batch, args.retry_all)
+        except PullAborted as exc:
+            print(f"\n!! ABORTED: {exc}\n   The log is flushed up to this point - re-run the "
+                  f"same command to resume.", file=sys.stderr)
+            sys.exit(1)
+        validate(log)
+        print_assumptions(None, pd.Timestamp(dates[-1]), scope, args.batch)
+        print_status(pd.Timestamp(dates[-1]), args.batch)
         return
 
     n_ciks = None if args.all else args.n_ciks   # None = no limit
     try:
-        log = pull_gap(n_ciks, ref, args.retry_all)
+        log = pull_gap(n_ciks, ref, args.retry_all, args.scope)
     except PullAborted as exc:
         print(f"\n!! ABORTED: {exc}\n   The log is flushed up to this point - re-run the "
               f"same command to resume.", file=sys.stderr)
         sys.exit(1)
     validate(log)
-    print_assumptions(n_ciks, ref)
+    print_assumptions(n_ciks, ref, args.scope)
     print_status(ref)
 
 
