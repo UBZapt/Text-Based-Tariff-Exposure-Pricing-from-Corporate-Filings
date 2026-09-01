@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import run_report
+
 import clean_controls_data as ccd
 import clean_data as cd
 import run_car_regression as rcr
@@ -32,6 +34,7 @@ import run_car_regression as rcr
 BASE = Path(__file__).resolve().parent
 CLEAN_DIR = BASE / "clean_data"
 OUTPUT_DIR = BASE / "output"
+REPORT_OUT = OUTPUT_DIR / "fm_panel_validation_report.txt"
 
 MONTHLY_RAW_FILE = ccd.MONTHLY_RAW_FILE      # unscreened CRSP monthly: return, cap, SIC
 SCREENED_CSV = ccd.MONTHLY_CSV               # clean_returns.csv - presence *is* the section 6 screen
@@ -39,7 +42,8 @@ BRIDGE_CSV = ccd.BRIDGE_CSV
 SUBSAMPLE_CSV = OUTPUT_DIR / "full_panel_firm_sample.csv"
 TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
 EPU_CSV = CLEAN_DIR / "clean_epu.csv"
-PANEL_OUT = CLEAN_DIR / "fm_panel.csv"
+INTERMEDIATE_DIR = BASE / "intermediate"   # derived analytical panel, as controls_panel is
+PANEL_OUT = INTERMEDIATE_DIR / "fm_panel.csv"
 
 # Sample window. The left edge is set by the momentum control, not by choice: Monthly Returns.csv
 # begins 2017-01-31 and no earlier return history exists anywhere in the project, so the twelve
@@ -529,12 +533,30 @@ def report(panel: pd.DataFrame, moments: pd.DataFrame, stats: dict) -> None:
     print(f"{'all':<8}{len(sizes):>8}{sizes.min():>8,}{sizes.mean():>8,.0f}{sizes.max():>8,}")
 
 
+def _up_to_date(outputs, label: str, force: bool) -> bool:
+    """True when every output already exists and the caller has not passed --force."""
+    missing = [p for p in outputs if not p.exists()]
+    if force or missing:
+        if missing and not force:
+            print(f"{label}: rebuilding - missing {', '.join(p.name for p in missing)}")
+        return False
+    print(f"{label}: already built, not regenerated. Outputs:")
+    for p in outputs:
+        print(f"  {p.name}  ({p.stat().st_size / 1e6:,.1f} MB)")
+    print("  Pass --force to rebuild.")
+    return True
+
+
 def main() -> pd.DataFrame | None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild even if the outputs already exist")
     ap.add_argument("--status", action="store_true",
                     help="report the funnel and monthly counts, then exit without writing")
     args = ap.parse_args()
+    if not args.status and _up_to_date([PANEL_OUT, REPORT_OUT], 'build_fm_panel', args.force):
+        return None
 
     permnos = load_subsample()
     raw, raw_stats = load_raw_monthly(permnos)
@@ -552,13 +574,14 @@ def main() -> pd.DataFrame | None:
     grid["exclusion_reason"] = exclusion_reasons(grid, texp_reason_map(years), fs_gvkeys)
     panel = grid.reindex(columns=OUTPUT_COLUMNS).sort_values(["ym", "permno"])
 
-    report(panel, moments, {"subsample": len(permnos), "raw": raw_stats, "grid": grid_stats,
-                            "screen": screen_stats, "texp": texp_stats, "mom": mom_stats,
-                            "controls": control_stats, "ff12": ff12_stats, "fs": fs_stats})
+    with run_report.capture(REPORT_OUT, title="STEP 7A - FAMA-MACBETH PANEL VALIDATION"):
+        report(panel, moments, {"subsample": len(permnos), "raw": raw_stats, "grid": grid_stats,
+                                "screen": screen_stats, "texp": texp_stats, "mom": mom_stats,
+                                "controls": control_stats, "ff12": ff12_stats, "fs": fs_stats})
     if args.status:
         return None
 
-    CLEAN_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(exist_ok=True)
     panel.to_csv(PANEL_OUT, index=False)
     print(f"\nWrote {PANEL_OUT.relative_to(BASE)} "
           f"({len(panel):,} rows x {len(panel.columns)} cols).")

@@ -37,6 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt                                    # noqa: E402
 from matplotlib.dates import DateFormatter, YearLocator            # noqa: E402
 
+import palette
 import build_fm_panel as bfp                                       # noqa: E402
 import clean_controls_data as ccd                                  # noqa: E402
 import run_car_regression as rcr                                   # noqa: E402
@@ -50,10 +51,17 @@ OUTPUT_DIR = BASE / "output"
 PANEL_CSV = bfp.PANEL_OUT
 TEXP_PANEL_CSV = bfp.TEXP_PANEL_CSV
 CAR_RESULTS_CSV = OUTPUT_DIR / "car_regression_results.csv"       # section 7.2, for the comparison
+SIGNFLIP_CSV = OUTPUT_DIR / "signflip_test_results.csv"           # section 7.2 per-sample TExp sd
+
+# Which section 7.2 event supplies the exposure vintage the per-standard-deviation conversion is
+# taken from. Named here rather than as a bare "2025-04-02" inside the reader, so it follows the
+# cycle registry if that changes rather than silently desynchronising the reported units.
+SECTION_72_EVENT = "impose"
 EPU_CSV = bfp.EPU_CSV
 LAMBDA_OUT = OUTPUT_DIR / "fm_lambda_panel.csv"
 CHART_OUT = OUTPUT_DIR / "fm_lambda_chart.png"
 REGIME_OUT = OUTPUT_DIR / "fm_epu_regime_results.csv"
+HEADLINE_OUT = OUTPUT_DIR / "fm_headline_results.csv"
 REPORT_OUT = OUTPUT_DIR / "fama_macbeth_validation_report.txt"
 
 TEXP_COLUMN = bfp.TEXP_COLUMN                 # texp_z, standardised within (vintage x subsample)
@@ -75,6 +83,23 @@ PRIMARY_SPEC = "full"
 # it so the choice is visibly not driving the result. Lag 0 leaves heteroskedasticity only.
 NW_LAGS = 6
 NW_LAG_GRID = (0, 3, 6, 12)
+
+# statsmodels' HAC finite-sample switches, stated rather than inherited. All three are the library
+# defaults, so nothing here changes a number - the point is that a reader can see the convention
+# instead of having to know what statsmodels does when they are omitted.
+#
+#   use_correction=False  no n/(n-k) scaling of the sandwich. At T = 96 the factor is 1.005 and
+#                         immaterial; at the T = 5 and T = 9 regime buckets it would be 1.12 and
+#                         1.06, so those errors are optimistic by about that much.
+#   adjust_df=False       statsmodels applies no cluster-style degrees-of-freedom adjustment to HAC.
+#   use_t=False           inference is standard-normal, not t(T-1). Also immaterial at T = 96 and
+#                         not at T = 5.
+#
+# They are left at the defaults deliberately: the primary series is 96 months, where all three are
+# negligible, and switching them only for the small buckets would put two conventions in one table.
+# The consequence for the sub-floor rows is that their p-values are optimistic on BOTH counts, and
+# the report says so beside the hac_reliable flag.
+HAC_KWDS = {"use_correction": False, "adjust_df": False, "use_t": False}
 
 # Degrees-of-freedom floor, not a sample choice: the full specification carries 18 parameters, so
 # 50 firms leaves ~32 residual degrees of freedom. Non-binding on this panel (the thinnest month
@@ -112,22 +137,18 @@ MIN_REGIME_MONTHS_FOR_HAC = 4 * NW_LAGS
 COVID_YEAR = 2020
 MONTHS_PER_LINE = 8               # month lists wrap rather than run off the report width
 
-REGIME_COLUMNS = ["split", "tau_pct", "tau", "regime", "n_months", "lambda_bar", "lambda_bar_pct",
-                  "nw_se", "nw_t", "nw_p", "iid_se", "hac_reliable", "diff",
-                  "welch_t", "welch_p", "welch_df", "hac_diff_se", "hac_diff_t", "hac_diff_p"]
+REGIME_COLUMNS = ["split", "tau_pct", "tau", "regime", "n_months", "series_contiguous",
+                  "lambda_bar", "lambda_bar_pct",
+                  "nw_se", "nw_t", "nw_p", "stars", "iid_se", "hac_reliable", "diff",
+                  "welch_t", "welch_p", "welch_df", "welch_stars",
+                  "hac_diff_se", "hac_diff_t", "hac_diff_p", "hac_diff_stars"]
 OUTSIDE_LABEL = "outside both episodes"
 
 # Chart. Two hues of the project's validated palette (decile_sort.PALETTE, dataviz reference
 # instance); this chart plots one series, so only slot 1 and the neutrals are used and there is no
 # legend - the title names the series. Validated on the light surface: #2a78d6 passes the
 # lightness band, chroma floor and 3:1 contrast against #fcfcfb.
-PALETTE = {
-    "surface": "#fcfcfb",
-    "series": "#2a78d6",
-    "ink": "#0b0b0b",
-    "ink_muted": "#52514e",
-    "grid": "#dcdcd8",
-}
+PALETTE = palette.roles(series="CATEGORICAL_1")
 EPISODE_ALPHA = 0.55
 N_LABELLED_EXTREMES = 2           # direct labels are selective by design; never one per point
 Y_PAD_LOW, Y_PAD_HIGH = 0.16, 0.20   # headroom the extreme and episode labels sit in
@@ -192,16 +213,44 @@ def load_panel(path: Path = PANEL_CSV) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def load_reference_sd(path: Path = TEXP_PANEL_CSV) -> tuple[float, int]:
-    """Cross-sectional sd of raw TExp in the section 7.2 event cross-section.
+    """Cross-sectional sd of raw TExp in the whole section 7.2 exposure vintage.
 
     Section 7.2 reports its coefficient in raw units and instructs the reader to multiply by the
-    sd of its own cross-section to read it per standard deviation. That cross-section is the whole
-    2025-04-02 vintage - the screened universe the event study runs on - not the 1,000-firm
-    subsample, so the conversion factor is taken from it.
+    sd of its own cross-section to read it per standard deviation. Two candidate cross-sections
+    exist and they differ: the whole 2025-04-02 vintage (2,868 firms) and the estimation sample
+    section 7.2 actually fits (about 1,554 firms after the FS and control exclusions), whose sd is
+    roughly 4.5% higher. This returns the vintage-wide figure and the report carries both, because
+    the estimation sample differs per window and per leg while the vintage does not - so only the
+    vintage gives one stable conversion factor for a table that spans them all.
+
+    The reference date is the registry's own, not a literal: this must follow the cycle definition
+    that decides which 10-K the event study reads.
     """
+    reference = ccd.CYCLES[rcr.BASELINE_CYCLE]["texp_ref"][SECTION_72_EVENT]
     vintage = pd.read_csv(path, usecols=["reference_date", TEXP_RAW])
-    cross = vintage.loc[vintage["reference_date"] == "2025-04-02", TEXP_RAW]
-    return float(cross.std()), len(cross)
+    cross = vintage.loc[vintage["reference_date"] == reference, TEXP_RAW]
+    if cross.empty:
+        raise ValueError(f"{path.name} holds no cross-section at {reference}; "
+                         f"available: {sorted(vintage['reference_date'].unique())}")
+    return float(cross.std(ddof=1)), len(cross)
+
+
+def sample_reference_sd(path: Path = SIGNFLIP_CSV) -> dict[str, float]:
+    """sd of raw TExp inside section 7.2's own estimation samples, per window.
+
+    The event study's H1 test records this per leg and window, so it is read rather than
+    recomputed. Reported beside the vintage-wide figure so the two conversion factors are visibly
+    different numbers instead of one number presented as both. Absent file returns {} - this is a
+    reporting nicety, not an input the test depends on.
+    """
+    if not path.exists():
+        return {}
+    frame = pd.read_csv(path)
+    if "sd_texp_left" not in frame.columns:
+        return {}
+    rows = frame[frame["label"].str.startswith("b^", na=False)]
+    return {str(window): float(block["sd_texp_left"].iloc[0])
+            for window, block in rows.groupby("window")}
 
 
 def episode_spans() -> list[dict]:
@@ -300,11 +349,15 @@ def newey_west(values: pd.Series, lags: int = NW_LAGS) -> dict:
 
     A constant-only OLS on {lambda_1,t} with a HAC covariance is exactly the Fama-MacBeth second
     stage: the coefficient is the mean and its standard error carries the autocorrelation
-    correction. statsmodels library defaults apply beyond maxlags.
+    correction. The finite-sample switches are named in HAC_KWDS rather than inherited silently.
+
+    The caller is responsible for handing this a CONTIGUOUS monthly series: a Bartlett kernel
+    reads row adjacency as month adjacency, so a series with holes in it gets the wrong weights.
+    regime_fit exists because the regime means used to violate that.
     """
     array = np.asarray(values, dtype=float)
-    fit = sm.OLS(array, np.ones((len(array), 1))).fit(cov_type="HAC",
-                                                      cov_kwds={"maxlags": lags})
+    fit = sm.OLS(array, np.ones((len(array), 1))).fit(
+        cov_type="HAC", cov_kwds={"maxlags": lags, **HAC_KWDS})
     return {"mean": float(fit.params[0]), "se": float(fit.bse[0]), "t": float(fit.tvalues[0]),
             "p": float(fit.pvalues[0]), "n_months": len(array), "lags": lags}
 
@@ -381,18 +434,38 @@ def welch(high: pd.Series, low: pd.Series) -> dict:
             "welch_df": float(result.df)}
 
 
-def hac_difference(values: pd.Series, indicator: pd.Series) -> dict:
-    """The same difference from a dummy regression, corrected the way the two levels are.
+def regime_fit(values: pd.Series, indicator: pd.Series) -> dict:
+    """Every regime statistic from ONE HAC fit on the UN-SPLIT series.
 
-    lambda_t = a + b*1{high} + e. OLS makes b identically the difference in group means, so no
-    point estimate changes; what changes is that Welch's independence assumption is replaced by
-    the autocorrelation correction already applied to each regime mean.
+    lambda_t = a + b*1{high} + e, fitted with Newey-West over the series as ordered, so the
+    Bartlett kernel sees genuine month adjacency. Then a is the low-regime mean, a + b the
+    high-regime mean and b the difference, each standard error read off the joint covariance by
+    t_test. OLS makes b identically the difference in group means, so no point estimate changes;
+    what changes is that Welch's independence assumption is replaced by the same autocorrelation
+    correction the levels carry.
+
+    This replaces calling newey_west() on frame.loc[indicator] and frame.loc[~indicator]
+    separately. Those subsets are scattered across the calendar - the p75 high-EPU bucket holds
+    eight months of 2020, two of early 2021, two from the whole 2018-19 trade war and ten from
+    2025 - so a lag-6 Bartlett kernel was giving observations three years apart the weight of
+    consecutive months. Only the standard errors were affected; every mean is unchanged.
     """
-    design = np.column_stack([np.ones(len(values)), indicator.to_numpy(dtype=float)])
-    fit = sm.OLS(values.to_numpy(dtype=float), design).fit(cov_type="HAC",
-                                                          cov_kwds={"maxlags": NW_LAGS})
-    return {"diff": float(fit.params[1]), "hac_diff_se": float(fit.bse[1]),
-            "hac_diff_t": float(fit.tvalues[1]), "hac_diff_p": float(fit.pvalues[1])}
+    y = values.to_numpy(dtype=float)
+    design = np.column_stack([np.ones(len(y)), indicator.to_numpy(dtype=float)])
+    fit = sm.OLS(y, design).fit(cov_type="HAC", cov_kwds={"maxlags": NW_LAGS, **HAC_KWDS})
+    tests = {"low": fit.t_test([[1.0, 0.0]]), "high": fit.t_test([[1.0, 1.0]])}
+    out = {"diff": float(fit.params[1]), "hac_diff_se": float(fit.bse[1]),
+           "hac_diff_t": float(fit.tvalues[1]), "hac_diff_p": float(fit.pvalues[1])}
+    for key, test in tests.items():
+        out[key] = {"mean": float(np.squeeze(test.effect)), "se": float(np.squeeze(test.sd)),
+                    "t": float(np.squeeze(test.tvalue)), "p": float(np.squeeze(test.pvalue))}
+    return out
+
+
+def is_contiguous(periods: pd.Series) -> bool:
+    """Whether these months form an unbroken monthly run, which HAC on them assumes."""
+    ordinals = pd.PeriodIndex(periods, freq="M").astype("int64").to_numpy()
+    return bool(len(ordinals) > 1 and np.all(np.diff(np.sort(ordinals)) == 1))
 
 
 def regime_split(frame: pd.DataFrame, indicator: pd.Series, split: str, high_label: str,
@@ -410,8 +483,13 @@ def regime_split(frame: pd.DataFrame, indicator: pd.Series, split: str, high_lab
     if high.empty or low.empty:
         raise ValueError(f"{split}: a regime is empty ({len(high)} high, {len(low)} low)")
 
-    shared = {"split": split, "tau_pct": tau_pct, "tau": tau,
-              **welch(high, low), **hac_difference(frame["lambda_texp"], indicator)}
+    fitted = regime_fit(frame["lambda_texp"], indicator)
+    contiguous = is_contiguous(frame["ym"])
+    shared = {"split": split, "tau_pct": tau_pct, "tau": tau, "series_contiguous": contiguous,
+              **welch(high, low),
+              **{k: fitted[k] for k in ("diff", "hac_diff_se", "hac_diff_t", "hac_diff_p")}}
+    shared["welch_stars"] = rcr.stars(shared["welch_p"])
+    shared["hac_diff_stars"] = rcr.stars(shared["hac_diff_p"])
 
     # A dummy regression's slope IS the difference in group means. If these disagree, the indicator
     # and the two subsamples are not the same partition - which no covariance choice would reveal.
@@ -425,12 +503,18 @@ def regime_split(frame: pd.DataFrame, indicator: pd.Series, split: str, high_lab
                          f"{frame['lambda_texp'].mean():.10f}")
 
     rows = []
-    for label, values in ((high_label, high), (low_label, low)):
-        test = newey_west(values)
+    for label, values, key in ((high_label, high, "high"), (low_label, low, "low")):
+        level = fitted[key]
+        # The fitted level must equal the subset's own mean - the same partition check, applied to
+        # the levels rather than the difference.
+        if not np.isclose(level["mean"], values.mean(), atol=1e-12):
+            raise ValueError(f"{split}/{label}: fitted level {level['mean']:.10f} does not equal "
+                             f"the subset mean {values.mean():.10f}")
         iid = sm.OLS(values.to_numpy(dtype=float), np.ones((len(values), 1))).fit()
         rows.append({**shared, "regime": label, "n_months": len(values),
-                     "lambda_bar": test["mean"], "lambda_bar_pct": test["mean"] * 100,
-                     "nw_se": test["se"], "nw_t": test["t"], "nw_p": test["p"],
+                     "lambda_bar": level["mean"], "lambda_bar_pct": level["mean"] * 100,
+                     "nw_se": level["se"], "nw_t": level["t"], "nw_p": level["p"],
+                     "stars": rcr.stars(level["p"]),
                      "iid_se": float(iid.bse[0]),
                      "hac_reliable": len(values) >= MIN_REGIME_MONTHS_FOR_HAC})
     return rows
@@ -463,6 +547,38 @@ def regime_table(primary: pd.DataFrame, taus: dict[int, float]) -> pd.DataFrame:
 
 def write_regime_results(table: pd.DataFrame, path: Path = REGIME_OUT) -> Path:
     """The machine-readable form of the section 10 and 11 tables."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    table.to_csv(path, index=False)
+    return path
+
+
+def headline_results(lambdas: pd.DataFrame, params: pd.DataFrame) -> pd.DataFrame:
+    """lambda_bar and its Newey-West test - the H2 statistic - in machine-readable form.
+
+    This existed only as report prose and a chart subtitle, so anyone rebuilding a table from the
+    output files got the per-month slopes and the regime split but not the single number H2 is
+    about. Carries both specifications (the H5 read), the whole NW lag grid so the lag choice is
+    visibly not driving anything, and every control's own lambda_bar.
+    """
+    rows = []
+    for spec in SPECS:
+        series = lambdas.loc[lambdas["spec"] == spec["name"], "lambda_texp"]
+        for lags in sorted({*NW_LAG_GRID, NW_LAGS}):
+            test = newey_west(series, lags=lags)
+            rows.append({"quantity": "lambda_texp_bar", "spec": spec["name"], "term": TEXP_COLUMN,
+                         "nw_lags": lags, "primary": lags == NW_LAGS and spec["name"] ==
+                         PRIMARY_SPEC, **test, "mean_pct": test["mean"] * 100,
+                         "stars": rcr.stars(test["p"])})
+    for row in control_means(params).itertuples(index=False):
+        rows.append({"quantity": "term_lambda_bar", "spec": PRIMARY_SPEC, "term": row.term,
+                     "nw_lags": NW_LAGS, "primary": False, "mean": row.mean, "se": row.se,
+                     "t": row.t, "p": row.p, "n_months": row.n_months, "lags": row.lags,
+                     "mean_pct": row.mean * 100, "stars": row.stars})
+    return pd.DataFrame(rows)
+
+
+def write_headline_results(table: pd.DataFrame, path: Path = HEADLINE_OUT) -> Path:
+    """The H2 headline, which previously reached no output file at all."""
     OUTPUT_DIR.mkdir(exist_ok=True)
     table.to_csv(path, index=False)
     return path
@@ -582,6 +698,12 @@ def _regime_block(rows: pd.DataFrame) -> None:
             _say(f"      {NW_LAGS}-lag HAC error. Its NW se {row.nw_se:.5f} against an iid "
                  f"{row.iid_se:.5f} is a")
             _say("      finite-sample artefact, not a precision gain. Indicative only.")
+        if not bool(lead["series_contiguous"]):
+            _say("      CAVEAT: this split is estimated on a series with CALENDAR GAPS - it")
+            _say("      excludes the other episode's months by construction. A Bartlett kernel")
+            _say(f"      reads row adjacency as month adjacency, so its {NW_LAGS}-lag weights are")
+            _say("      wrong across each gap. The means are unaffected; the errors are")
+            _say("      approximate. The full-sample splits above carry no such gap.")
         _say()
 
 
@@ -798,13 +920,26 @@ def write_report(panel: pd.DataFrame, sample: pd.DataFrame, lambdas: pd.DataFram
     _say("  The design's nominated comparison. Section 7.2 reports b in raw TExp units and")
     _say(f"  instructs the reader to multiply by the sd of its own cross-section; that")
     _say(f"  cross-section is the whole 2025-04-02 vintage, {ref_n:,} firms, sd {ref_sd:.6f}.")
+    sample_sds = sample_reference_sd()
+    if sample_sds:
+        _say("  Two conversion factors exist and they are not the same number. The vintage-wide sd")
+        _say("  above is one stable figure for a table spanning several windows and both legs; the")
+        _say("  sd inside each regression's own estimation sample, after the FS and control")
+        _say("  exclusions, is higher - so the per-s.d. column below is conservative by that much:")
+        for window, sd in sample_sds.items():
+            _say(f"    {rcr._short(window):<12}estimation-sample sd {sd:.6f}  "
+                 f"({sd / ref_sd - 1:+.1%} against the vintage)")
+        _say("  The vintage figure is used throughout, and this is the size of the understatement.")
     if CAR_RESULTS_CSV.exists():
         car = pd.read_csv(CAR_RESULTS_CSV)
         car = car[(car["term"] == TEXP_RAW) & (car["spec"] == "primary")]
-        _say(f"  {'run':<24}{'window':<12}{'b raw':>10}{'b per s.d.':>13}{'as %':>9}")
+        _say(f"  {'run':<24}{'window':<12}{'b raw':>10}{'b per s.d.':>13}{'as %':>9}"
+             f"{'as % (own sd)':>16}")
         for row in car.itertuples(index=False):
+            own = sample_sds.get(row.window)
+            own_cell = "-" if own is None else f"{row.coef * own * 100:.2f}"
             _say(f"  {row.run:<24}{rcr._short(row.window):<12}{row.coef:>10.4f}"
-                 f"{row.coef * ref_sd:>13.5f}{row.coef * ref_sd * 100:>9.2f}")
+                 f"{row.coef * ref_sd:>13.5f}{row.coef * ref_sd * 100:>9.2f}{own_cell:>16}")
         widest = car[car["window"] == "car_m10p10"]["coef"].abs().max() * ref_sd
         _say(f"  Largest event-window effect: {widest * 100:.2f}% over up to 21 trading days,")
         _say(f"  against a mean monthly premium of {head['mean'] * 100:+.3f}%. An event-window")
@@ -1054,6 +1189,30 @@ def write_report(panel: pd.DataFrame, sample: pd.DataFrame, lambdas: pd.DataFram
     _say("     The floor is 4 x the NW lag, set from the lag length and not from which regimes it")
     _say("     catches. Nothing is re-estimated in sections 10-12: they classify the same 96")
     _say("     slopes, so no number in sections 1-9 can move.")
+    _say(" 14. Each regime's mean and NW error now come from ONE HAC fit on the un-split series")
+    _say("     (regime_fit), not from applying the HAC estimator to the high and low subsets")
+    _say("     separately. The subsets are scattered across the calendar - the p75 high bucket")
+    _say("     holds eight months of 2020, two of early 2021, two from the whole 2018-19 trade")
+    _say("     war and ten from 2025 - and a Bartlett kernel reads row adjacency as month")
+    _say("     adjacency, so observations years apart were being given consecutive-month weights.")
+    _say("     Every regime mean is unchanged to machine precision (a dummy regression's fitted")
+    _say("     levels ARE the group means, asserted); only the errors move, by 0.95x to 1.09x.")
+    _say("     The two per-episode splits still carry calendar gaps by construction and are")
+    _say("     flagged in their own blocks; series_contiguous records it per row.")
+    _say(" 15. The HAC finite-sample switches are named in HAC_KWDS rather than inherited")
+    _say("     silently: use_correction, adjust_df and use_t are all False, which are the")
+    _say("     statsmodels defaults, so no number changes. They are left there deliberately - at")
+    _say("     96 months all three are negligible, and switching them only for the small buckets")
+    _say("     would put two conventions in one table. The consequence is that the sub-floor rows'")
+    _say("     p-values are optimistic on two counts at once: no small-sample scaling and a")
+    _say("     normal rather than t reference distribution.")
+    _say(" 16. Two per-standard-deviation conversion factors exist and section 8 reports both.")
+    _say("     The vintage-wide sd is used throughout because it is one stable figure across")
+    _say("     windows and legs; the estimation sample's own sd is 4.5% higher, so the reported")
+    _say("     per-s.d. figures are conservative by that much rather than wrong.")
+    _say(" 17. lambda_bar and its Newey-West test now reach a file, fm_headline_results.csv. The")
+    _say("     H2 statistic previously existed only as report prose and a chart subtitle, so a")
+    _say("     reader rebuilding tables from the outputs got H3 but not H2.")
 
     _section("14. Outputs")
     for path in paths:
@@ -1078,6 +1237,8 @@ def main() -> pd.DataFrame:
     lambdas.assign(ym=lambdas["ym"].astype(str)).to_csv(LAMBDA_OUT, index=False)
     chart = plot_lambda(primary, episodes, newey_west(primary["lambda_texp"]))
 
+    headline_csv = write_headline_results(headline_results(lambdas, params))
+
     # Section 7.5 - a classification of the slopes just estimated, not a second estimation.
     taus, epu_series, tau_stats = epu_thresholds()
     verify_epu_lag(primary, epu_series)
@@ -1085,7 +1246,7 @@ def main() -> pd.DataFrame:
     regime_csv = write_regime_results(regimes)
 
     write_report(panel, sample, lambdas, params, episodes, regimes, taus, tau_stats,
-                 [LAMBDA_OUT, chart, regime_csv, REPORT_OUT])
+                 [LAMBDA_OUT, chart, headline_csv, regime_csv, REPORT_OUT])
     print("\n".join(_REPORT))
     return lambdas
 

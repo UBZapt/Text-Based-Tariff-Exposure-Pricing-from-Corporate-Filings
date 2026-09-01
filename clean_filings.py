@@ -34,6 +34,7 @@ import pandas as pd
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 import edgar_pull
+import run_report
 
 # Inline-XBRL filings carry an XML declaration but are parsed as HTML deliberately:
 # the HTML tree builder is what tolerates the malformed markup these documents contain.
@@ -48,7 +49,11 @@ OUTPUT_DIR = BASE / "output"
 LOG_CSV = BASE / "edgar_pull_log.csv"
 FILINGS_DIR = BASE / "filings_raw"     # must match edgar_pull.FILINGS_DIR
 CLEAN_OUT = CLEAN_DIR / "clean_filings.csv"
-DIAG_OUT = OUTPUT_DIR / "cleaning_diagnostics.csv"
+# The per-filing audit table this used to write to output/cleaning_diagnostics.csv was
+# byte-for-byte identical to clean_data/clean_filings.csv - write_diagnostics wrote the whole
+# cleaned table, whose schema already IS the diagnostics schema - and nothing read it. Removed;
+# the run record it was standing in for is now a real report.
+REPORT_OUT = OUTPUT_DIR / "filing_cleaning_validation_report.txt"
 # One gzipped {item_1a, rest} document per accession. The text lives here rather than in
 # CLEAN_OUT because the full corpus is ~380 KB of prose per filing: as columns that is a
 # ~5.3 GB CSV which cannot be built or re-read without exhausting memory, while per-accession
@@ -402,7 +407,9 @@ def _listed(sub: pd.DataFrame) -> str:
         return ""
     ids = [f"{r.cik}/{r.accession}" for r in sub.head(MAX_LISTED).itertuples(index=False)]
     more = len(sub) - len(ids)
-    return " ".join(ids) + (f" (+{more} more, see {DIAG_OUT.name})" if more else "")
+    # The full identities live in the cleaned metadata table itself - which is what the removed
+    # diagnostics CSV was a byte-identical copy of - so that is where a reader is pointed.
+    return " ".join(ids) + (f" (+{more} more, see {CLEAN_OUT.name})" if more else "")
 
 
 def _scan_text(df: pd.DataFrame) -> tuple[list[int], int]:
@@ -427,18 +434,6 @@ def _scan_text(df: pd.DataFrame) -> tuple[list[int], int]:
             artifact_rows.append(i)
         shattered += len(SHATTERED_WORD_RE.findall(both))
     return artifact_rows, shattered
-
-
-def write_diagnostics(df: pd.DataFrame) -> Path:
-    """Write the per-filing audit table: the output schema minus the two text columns.
-
-    At full-corpus scale the console cannot carry one line per dropped or flagged filing, so
-    the identities live here and the console reports counts plus the first few.
-    """
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    df.to_csv(DIAG_OUT, index=False)
-    print(f"Wrote {DIAG_OUT.relative_to(BASE)} ({len(df):,} rows) - per-filing cleaning audit.")
-    return DIAG_OUT
 
 
 def validate(df: pd.DataFrame) -> dict:
@@ -595,7 +590,12 @@ def main() -> pd.DataFrame | None:
     if args.status:
         return None
     if not n_docs:
-        print("Nothing to clean.")
+        # A completed corpus still re-emits its validation report. Returning here without one
+        # meant an idempotent re-run silently produced no record of the stage at all.
+        print("Nothing to clean; re-validating the existing corpus.")
+        existing = read_clean_filings()
+        with run_report.capture(REPORT_OUT, title="STEP 2A - FILING CLEANING VALIDATION"):
+            validate(existing)
         return None
 
     stale = clear_partials()
@@ -620,8 +620,8 @@ def main() -> pd.DataFrame | None:
     rt = verify_roundtrip(df)
     print(f"Round-trip verified: {rt['rows']:,} metadata rows, cik padding preserved, "
           f"{rt['sampled']:,} documents re-read ({rt['chars_verified']:,} chars intact).")
-    write_diagnostics(full)
-    validate(full)
+    with run_report.capture(REPORT_OUT, title="STEP 2A - FILING CLEANING VALIDATION"):
+        validate(full)
     return df
 
 

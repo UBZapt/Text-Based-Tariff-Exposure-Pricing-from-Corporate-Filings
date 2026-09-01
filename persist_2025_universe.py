@@ -16,6 +16,7 @@ the design does not ask for.
     python persist_2025_universe.py
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +36,7 @@ CAR_FILE = ec.RUNS[0]["out"]
 SCREEN_COLUMN = "in_screened_universe_pit"
 
 UNIVERSE_OUT = OUTPUT_DIR / "event_study_firm_universe.csv"
+REPORT_OUT = OUTPUT_DIR / "event_study_universe_validation_report.txt"
 
 # The reference date the existing 2025 pull ran at. Identifiers are resolved at this date so
 # cik_2025 reproduces what that pull actually used.
@@ -44,9 +46,23 @@ OUTPUT_COLUMNS = ["permno", "gvkey", "cik_2025"]
 MAX_LISTED = 20          # identities printed before deferring to a count
 RULE = "=" * 74
 
+# Buffered rather than printed straight out, so the run record can be persisted beside the
+# artifact it describes - the pattern every other stage in the project follows. Previously this
+# script's 26 lines of validation, including its pull-coverage check and four recorded
+# assumptions, reached the terminal and nowhere else.
+_REPORT: list[str] = []
+
 
 def _say(line: str = "") -> None:
-    print(line)
+    _REPORT.append(line)
+
+
+def write_report(path: Path | None = None) -> Path:
+    """Persist the buffered run record."""
+    path = REPORT_OUT if path is None else path
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    path.write_text("\n".join(_REPORT), encoding="utf-8")
+    return path
 
 
 def _section(title: str) -> None:
@@ -65,13 +81,18 @@ def _listed(values) -> str:
 # --------------------------------------------------------------------------- #
 # Assembly                                                                     #
 # --------------------------------------------------------------------------- #
-def load_screened_permnos(path: Path = CAR_FILE) -> list[int]:
+def load_screened_permnos(path: Path | None = None) -> list[int]:
     """Read the CAR table and return the PERMNOs inside the end-March-2025 screen.
 
     Read through estimate_car.read_car rather than pd.read_csv: the screen flag returns as
     object once any row is blank, and a truthiness test on that would silently keep every row.
+
+    The path resolves at call time, not at definition. ``CAR_FILE`` derives from ``ec.RUNS``, which
+    ``estimate_car.select_cycle`` rebinds, so a default argument would freeze whichever cycle was
+    active on import - the trap CLAUDE.md records and the one already closed in the three
+    event-study scripts.
     """
-    car = ec.read_car(path)
+    car = ec.read_car(CAR_FILE if path is None else path)
     return sorted(int(p) for p in car.loc[car[SCREEN_COLUMN], "permno"])
 
 
@@ -154,7 +175,8 @@ def validate(frame: pd.DataFrame, permnos: list[int], unresolved: list[int]) -> 
                 if r.cik_2025.zfill(10) != str(logged[int(r.permno)]).strip().zfill(10)]
     _say(f"PERMNOs present in the log : {len(checked):,} of {len(frame):,}")
     _say(f"cik_2025 mismatches        : {len(mismatch)} {_listed(mismatch) if mismatch else ''}")
-    assert not mismatch, "cik_2025 disagrees with the log; the audit column is not faithful."
+    if mismatch:
+        raise ValueError("cik_2025 disagrees with the log; the audit column is not faithful.")
 
     # -- coverage: did the 2025 pull reach every firm in this universe? ----- #
     _section("2025 PULL COVERAGE OF THIS UNIVERSE  (definition-of-done check)")
@@ -202,6 +224,31 @@ def print_assumptions() -> None:
 
 
 def main() -> pd.DataFrame:
+    ap = argparse.ArgumentParser(description="Persist the fixed 2025 event-study universe.")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="replace an existing universe file (it is meant to be written once)")
+    args = ap.parse_args()
+
+    # The universe is a written-once list, and the 1,000-firm subsample is drawn as INDICES into
+    # its enumeration order. So silently rewriting it breaks that draw even though the sample file
+    # is itself guarded: estimate_car rewrites the CAR table on every run, and if the screened set
+    # has changed size or composition since, the same seed then selects a different 1,000 firms
+    # from a pool that no longer matches the recorded N. Nothing downstream detects that, so the
+    # guard belongs here - sample_full_panel_firms.py has had the equivalent since it was written.
+    if UNIVERSE_OUT.exists() and not args.rebuild:
+        _section("UNIVERSE ALREADY PERSISTED - NOT REGENERATED")
+        existing = read_universe()
+        _say(f"  {UNIVERSE_OUT.relative_to(BASE)}  ({len(existing):,} firms)")
+        _say()
+        _say("  This list is written once and reused unchanged. The full-panel subsample is drawn")
+        _say("  as indices into its enumeration order, so replacing it silently would make the")
+        _say("  recorded seed select a different 1,000 firms. Pass --rebuild only deliberately,")
+        _say("  and re-draw the sample with sample_full_panel_firms.py --redraw afterwards.")
+        _say()
+        _say(f"  {write_report().relative_to(BASE)}")
+        print("\n".join(_REPORT))
+        return existing
+
     permnos = load_screened_permnos()
     frame, unresolved = resolve_identifiers(permnos)
     path = write_universe(frame)
@@ -209,6 +256,8 @@ def main() -> pd.DataFrame:
     print_assumptions()
     _section("OUTPUT")
     _say(f"  {path.relative_to(BASE)}  ({len(frame):,} rows x {len(frame.columns)} cols)")
+    _say(f"  {write_report().relative_to(BASE)}")
+    print("\n".join(_REPORT))
     return frame
 
 

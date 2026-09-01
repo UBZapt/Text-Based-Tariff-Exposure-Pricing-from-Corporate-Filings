@@ -19,9 +19,11 @@
 *.tar
 *.7z
 *.txt
+!requirements.txt
 
 # Pipeline outputs derived from licensed data (redundant with *.csv/*.parquet, kept explicit)
 clean_data/
+intermediate/
 clean_firm_bridge.csv
 edgar_pull_log.csv
 
@@ -58,7 +60,10 @@ id_rsa
 *.ppk
 
 # --- Claude Code local settings ---
-.claude/settings.local.json
+# The whole directory, not just settings.local.json: permission allowlists accumulate literal
+# command lines, which have already captured a personal email address once, and anything else
+# added to this directory would otherwise be tracked by default.
+.claude/
 
 # --- CLAUDE.md-mandated minimums ---
 output/

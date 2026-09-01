@@ -24,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import run_report
+
 import persist_2025_universe as pu
 
 # --------------------------------------------------------------------------- #
@@ -34,6 +36,7 @@ OUTPUT_DIR = BASE / "output"
 
 UNIVERSE_CSV = pu.UNIVERSE_OUT
 SAMPLE_OUT = OUTPUT_DIR / "full_panel_firm_sample.csv"
+REPORT_OUT = OUTPUT_DIR / "full_panel_sample_validation_report.txt"
 
 # Recorded seed. Arbitrary in value - it is the imposition event date read as an integer - but
 # fixed and stated, which is the section 7.0 requirement: the draw must be exactly reproducible.
@@ -129,16 +132,21 @@ def validate(sample: pd.DataFrame, universe: pd.DataFrame, idx: np.ndarray) -> N
     _say(f"Seed                  : {SEED}")
     _say(f"Enumeration order     : ascending {ORDER_COLUMN}")
 
-    assert len(set(idx)) == len(idx) == SAMPLE_SIZE, "draw is not n distinct indices"
-    assert len(sample) == SAMPLE_SIZE, "sample row count does not match the draw"
-    assert set(sample["permno"]) <= set(universe["permno"]), "sample is not a subset of the universe"
-    assert sample["permno"].is_unique, "duplicate PERMNO in the sample"
+    if not len(set(idx)) == len(idx) == SAMPLE_SIZE:
+        raise ValueError("draw is not n distinct indices")
+    if len(sample) != SAMPLE_SIZE:
+        raise ValueError("sample row count does not match the draw")
+    if not set(sample["permno"]) <= set(universe["permno"]):
+        raise ValueError("sample is not a subset of the universe")
+    if not sample["permno"].is_unique:
+        raise ValueError("duplicate PERMNO in the sample")
     _say("Distinct indices      : yes (asserted)")
     _say("Subset of universe    : yes (asserted)")
 
     # Re-running the generator must reproduce the identical draw from the seed alone.
     repeat, _ = draw_sample(universe)
-    assert repeat["permno"].tolist() == sample["permno"].tolist(), "draw is not reproducible"
+    if repeat["permno"].tolist() != sample["permno"].tolist():
+        raise ValueError("draw is not reproducible")
     _say("Reproducible from seed: yes (asserted, re-drawn and compared)")
 
     no_cik = sample.loc[sample["cik_2025"] == "", "permno"]
@@ -175,6 +183,12 @@ def print_assumptions() -> None:
 
 
 def main() -> pd.DataFrame:
+    with run_report.capture(REPORT_OUT,
+                            title="STEP 1E - FULL-PANEL SUBSAMPLE DRAW"):
+        return _run()
+
+
+def _run() -> pd.DataFrame:
     ap = argparse.ArgumentParser(description="Draw the fixed full-panel firm subsample.")
     ap.add_argument("--redraw", action="store_true",
                     help="replace an existing sample file (the draw is meant to be fixed once)")

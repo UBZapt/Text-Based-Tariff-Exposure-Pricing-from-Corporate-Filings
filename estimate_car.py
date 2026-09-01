@@ -27,6 +27,10 @@ import clean_controls_data as ccd
 # --------------------------------------------------------------------------- #
 BASE = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE / "output"
+# Derived analytical panels and per-document diagnostics live here, not in output/.
+# output/ is for final results, validation reports and figures; these are inputs to a later
+# stage or per-row audit tables, and two of them are the largest files in the repo.
+INTERMEDIATE_DIR = BASE / "intermediate"
 
 # The panel path, the event dates and the cycle registry are owned by Script 1, which writes them;
 # importing rather than re-declaring keeps one definition (the precedent score_filings.py set for
@@ -70,7 +74,7 @@ RUNS_2025 = [
         "name": "imposition_primary",
         "event": "impose",
         "anchor": "2025-01-20",
-        "out": OUTPUT_DIR / "car_imposition_primary.csv",
+        "out": INTERMEDIATE_DIR / "car_imposition_primary.csv",
         # Change of administration. Tariff-policy expectations re-price from this date, so the
         # cleanest pre-regime loadings come from a window that closes before it. Not a trading
         # day (MLK Day), which is why the anchor is resolved against the calendar.
@@ -81,7 +85,7 @@ RUNS_2025 = [
         "name": "imposition_robustness",
         "event": "impose",
         "anchor": "2025-02-13",
-        "out": OUTPUT_DIR / "car_imposition_robustness.csv",
+        "out": INTERMEDIATE_DIR / "car_imposition_robustness.csv",
         # Later anchor, so a longer window (219 vs 202 days): it buys estimation data at the cost
         # of including the post-inauguration period in the loadings.
         "anchor_note": "reciprocal-trade memorandum; longer window, accepts post-inauguration "
@@ -91,7 +95,7 @@ RUNS_2025 = [
         "name": "reversal_primary",
         "event": "reverse",
         "anchor": "2025-05-28",
-        "out": OUTPUT_DIR / "car_reversal_primary.csv",
+        "out": INTERMEDIATE_DIR / "car_reversal_primary.csv",
         # First judicial reversal signal; closing before it keeps the reversal loadings free of
         # litigation-outcome repricing. This window deliberately CONTAINS the imposition event and
         # its aftermath - no dates are excised (see the contamination checks in validate).
@@ -125,7 +129,7 @@ def build_runs(cycle_name: str) -> list[dict]:
         "name": name,
         "event": name,
         "anchor_offset": offset,
-        "out": OUTPUT_DIR / f"car_cc_{name}.csv",
+        "out": INTERMEDIATE_DIR / f"car_cc_{name}.csv",
         "anchor_note": f"uniform rule: window closes {abs(offset)} trading days before the event, "
                        f"the last day before the widest event window [{widest},+{-widest}] opens",
     } for name in cycle["events"]]
@@ -530,7 +534,7 @@ def run_event(panel: pd.DataFrame, excess: pd.DataFrame, fmat: np.ndarray,
 
 def write_car(frame: pd.DataFrame, path: Path) -> Path:
     """Write one run's per-firm CAR table."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(exist_ok=True)
     frame.to_csv(path, index=False)
     return path
 
