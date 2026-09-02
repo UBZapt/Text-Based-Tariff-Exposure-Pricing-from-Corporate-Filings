@@ -80,6 +80,9 @@ python run_car_regression.py  --cycle cross_cycle    # ~15 s   §7.6 + H4 + H1 t
 python decile_sort.py                               # ~20 s   §7.3, both universes
 python build_fm_panel.py                            #  ~2 min monthly panel
 python fama_macbeth_pricing.py                      #  ~3 s   §7.4 + §7.5
+python figures_event_study.py                       #  ~6 s   4 figures + 1 table for §7.2, §7.6, §5.2
+python figures_panel.py                             #  ~2 s   3 figures for §7.4, §7.5
+python figures_collinearity.py                      #  ~6 s   3 correlation grids + 1 scatter grid
 python build_results_workbook.py                    #  ~2 s   merges every results table
 ```
 
@@ -96,7 +99,12 @@ re-issuing the same command. `--status` on either reports progress and writes no
    CAR tables must be on disk.
 2. **`decile_sort.py` and `fama_macbeth_pricing.py` have no `--cycle` flag.** Both are 2025-only
    by construction and read the unsuffixed artifacts.
-3. **`build_results_workbook.py` runs last**, since it reads every results CSV.
+3. **The three `figures_*.py` scripts run after every analytical stage**, since each reads the
+   persisted results. `figures_event_study.py` additionally reconciles against
+   `output/decile_sort_results.csv` and against the three 2025 CAR tables, and raises if either
+   disagrees, so `decile_sort.py` and `estimate_car.py --cycle 2025` must have completed.
+4. **`build_results_workbook.py` runs last**, since it reads every results CSV. It reads no figure
+   and is unaffected by them.
 
 ### The two fixed firm lists, and the bootstrap they sit in
 
@@ -130,7 +138,7 @@ clean_data.py
 
 | Directory | Contents | Tracked? |
 | --- | --- | --- |
-| `output/` | **Final results only**: results CSVs, the merged workbook, 14 validation reports, 4 figures, and the two fixed firm lists | no |
+| `output/` | **Final results only**: results CSVs, the merged workbook, 14 validation reports, 16 figures, and the two fixed firm lists | no |
 | `intermediate/` | Derived analytical panels and per-row audit tables: `controls_panel{,_cross_cycle}.csv`, 12 per-firm `car_*.csv`, `fm_panel.csv`, `scoring_diagnostics.csv`, `texp_panel_diagnostics.csv` | no |
 | `clean_data/` | Cleaned source data: returns, bridge, factors, EPU, filings metadata, TExp scores and panel, FS | no |
 | `clean_text/` | 13,972 gzipped `{item_1a, rest}` documents — the cleaned corpus | no |
@@ -155,6 +163,88 @@ plain `print` are teed to disk by `run_report.capture`, so the console text and 
 identical — see `run_report.py` for why that route was taken rather than rewriting ~150 call
 sites.
 
+### Figures
+
+Sixteen PNGs at 300 dpi and one fixed-width text table, all drawn from persisted pipeline output.
+They are formatted against one worked example — R base graphics: white ground, sans-serif, bold
+centred title, no gridlines, tick labels rotated ninety degrees, boxed legend. The palette is a
+muted set — a desaturated dark blue, a mid grey and a desaturated dark green — with a solid black
+reference line at zero; the correlation grids' warm end is a muted red. `chartstyle.py` is the
+single definition of that furniture and `palette.py` of its colours; no drawing module restates
+either.
+
+Two details depart from the worked example, both because it misread on this project's data. The
+left and bottom axis lines span the full limits and therefore **meet at the origin corner**: the
+example bounds each spine to its tick range, which on a monthly series starting mid-year left a
+gap between the two lines that reads as missing data. And bar outlines are drawn at
+`BAR_EDGE_WIDTH = 0.25` rather than at axis weight, thin enough for a hatch to read without
+framing every fill in black.
+
+**Every figure carries a title, axis labels with units, data labels and a legend, and nothing
+else.** Descriptive captions belong above the figure in the dissertation document, not inside the
+image, so there is deliberately no subtitle or footnote helper. Where a caption previously lived
+inside a PNG the information was already in a results CSV or a validation report; nothing was lost.
+
+| Figure | Design section | Written by |
+| --- | --- | --- |
+| `fig_car_event_time{,_equal_weighted}.png` | §7.2 / H3b — cumulative CAAR by event day, both legs | `figures_event_study` |
+| `fig_car_coefficients.png` | §7.2 / H1 — b per leg per window, 95% CI | `figures_event_study` |
+| `fig_cross_cycle_coefficients.png` | §7.6 / H4 — b at nine 2018–19 events plus the 2025 pair, as a line per window | `figures_event_study` |
+| `table_industry_split.txt` | v6 §5.2 item 1 — b within each FF12 group, coefficient and s.e. per window | `figures_event_study` |
+| `fig_epu_regime_premium.png` | §7.5 / H3 — the monthly premium with the high-EPU months shaded | `figures_panel` |
+| `fig_epu_regime.png` | §7.5 — EPU series, its three thresholds, the high-EPU months | `figures_panel` |
+| `fig_fm_cross_section.png` | §7.4 + v6 §5.2 item 6 — firms per month, within-month R² | `figures_panel` |
+| `fig_corr_event_study.png`, `fig_corr_fm_panel.png` | v6 §5.2 item 1 — regressor correlations | `figures_collinearity` |
+| `fig_corr_factor_loadings.png` | v6 §5.2 item 1 — TExp against the FF5+MOM loadings | `figures_collinearity` |
+| `fig_texp_scatter_grid.png` | v6 §5.2 item 1 — TExp against each regressor, five panels | `figures_collinearity` |
+| `decile_sort_chart{,_equal_weighted}{,_ex_megacap}.png` | §7.3 — group CAR, four (universe × weighting) | `decile_sort` |
+| `texp_fs_scatter.png` | §7.1 — TExp against foreign-sales share | `foreign_sales` |
+| `fm_lambda_chart.png` | §7.4 — the monthly premium, episodes marked | `fama_macbeth_pricing` |
+
+**Two reconciliations run before any figure is drawn, and raise rather than warn.** The event-time
+trajectory needs abnormal returns day by day, which no file holds — `intermediate/car_*.csv` carries
+only the three cumulative CARs. `figures_event_study.py` therefore rebuilds them through
+`estimate_car`'s public functions (it does **not** call `main()`, which would rewrite the CAR tables,
+and does not edit that module), then asserts (i) the CARs it can re-derive match the persisted tables
+to `1e-12`, measured worst case **4.4e-16**, and (ii) its group aggregation reproduces all 180 cells
+of `decile_sort_results.csv` to `1e-10`, measured worst case **1.4e-16**. `figures_panel.py` likewise
+asserts that the EPU thresholds it shades on match the `tau` column of `fm_epu_regime_results.csv`.
+
+Coefficients are drawn in percentage points of CAR per unit of exposure, not per standard deviation:
+the cross-cycle sd ranges 0.0048 to 0.0122 across the nine events, so no single scale factor exists
+and a per-event one would make the panels incomparable in a figure whose subject is comparability.
+
+Assessed and deliberately **not** produced, with reasons, in `build_notes.md` Step 9: a long-horizon
+return series (v6 retires the portfolio programme and §7.3 bars performance exhibits), a bar chart of
+λ̄₁, a lexicon term-frequency chart, a per-regime firm count, a CAR-against-TExp scatter, and pipeline
+diagnostics already covered by the validation reports. Two exhibits were **withdrawn** on 2026-09-02:
+`fig_epu_regime_coefficients.png`, the six-split regime bar chart, whose H3 content
+`fig_epu_regime_premium.png` now carries month by month; and `fig_industry_split.png`, replaced by
+`table_industry_split.txt` because thirty-six estimates with intervals several times the width of
+their point say only that nothing is precisely estimated inside an industry, which a table of
+coefficients and standard errors states checkably.
+
+#### Visual revision, dated 2026-09-02
+
+A presentation pass on the whole set. No estimate, sample or standard error changed: re-running
+`foreign_sales.py --force`, `decile_sort.py` and `fama_macbeth_pricing.py` left all of their
+results CSVs and validation reports `cmp`-identical, and `figures_event_study.py`'s two
+reconciliations still pass at 4.4e-16 and 1.4e-16. What changed:
+
+| Change | Reason |
+| --- | --- |
+| Palette moved from R's saturated primaries to a muted dark blue / mid grey / dark green, and `ZERO` (red, dashed) was retired in favour of a solid black line at zero drawn in `INK` | the primaries print harshly and, at line weight, read as brighter than the data they carry; a dashed red rule at zero was read as a second data series rather than as the axis |
+| `chartstyle.frame` spans both spines to the axis limits instead of bounding them to the tick range | the tick-range form left a gap at the origin corner on any series whose first observation falls before the first tick, which reads as missing data |
+| Bar outlines dropped from `AXIS_WIDTH` to `BAR_EDGE_WIDTH = 0.25` | thin enough for the decile chart's hatch to read, not thick enough to frame every fill in black |
+| `chartstyle.figure_legend` added, and the two event-time panels and both regime charts use it | a panel-level legend covered data in whichever corner it was placed; centred under the title it belongs to both panels and hides neither |
+| `chartstyle.value_labels` added, and `fig_car_coefficients.png` labels each bar with its estimate and stars | four estimates quoted in the text, so the number belongs on the bar; `star_labels` stays for the eleven-event figure, read for shape |
+| `fig_cross_cycle_coefficients.png` redrawn as a line with a marker per event, loosening events shaded rather than given a second colour | eleven bars per panel × three panels did not let the coefficient's path across the two cycles be followed; the predicted sign is a property of the event and holds across all three panels |
+| `fig_epu_regime.png`'s y scale pinned to zero, and its shading moved onto `high_epu_spans` | autoscaling put the floor near 60, leaving the line running off the bottom of the frame; the per-point fill drew an isolated high-EPU month too narrow to see, and there are three of them. The helper is shared with the premium chart, so the two figures cannot disagree about which months the split called elevated |
+| `fig_epu_regime_premium.png` added; `fig_epu_regime_coefficients.png` withdrawn | §7.5's headline is the monthly premium against the high-uncertainty months. The bar chart put the six regime means side by side but hid that the elevated bucket is a handful of clustered months rather than a recurring condition; the means and their Newey-West tests remain in `fm_epu_regime_results.csv` |
+| `table_industry_split.txt` added; `fig_industry_split.png` withdrawn | see above |
+| `fig_corr_factor_loadings.png` added | asks the collinearity question of the risk model rather than of the controls: whether TExp repackages the FF5+MOM loadings the abnormal returns are already purged of. Free to draw — `estimate_car` persists each firm's six loadings in the CAR table, so no beta is re-estimated |
+| `fig_texp_scatter_grid.png` added | a correlation cell reports one number per pair and cannot distinguish a linear relation from a mass point plus a tail, which is the shape TExp has |
+
 ## Configuration a re-runner would change
 
 All of these are declared in a marked `Configuration` block at the top of their module.
@@ -173,6 +263,8 @@ All of these are declared in a marked `Configuration` block at the top of their 
 | `MAX_PERIOD_STALENESS_MONTHS = 15` | `build_texp_panel` | contemporaneity rule, per reference date |
 | `CARRY_MONTHS = 12`, `SAMPLE_START/END` | `build_fm_panel` | exposure carry-forward bound and the panel window |
 | `REFERENCE_WINDOW`, `RHO_STRONG`, `MONOTONE_MAX_FLIPS` | `decile_sort` | weights for the size diagnostics, and the monotonicity verdict thresholds |
+| `SURFACE`, `CATEGORICAL_1..3`, `DIVERGE_WARM`, `INK`, `GRID` | `palette` | **the single definition of every chart colour** — six modules build role names from it |
+| `DPI`, `SIZE_*`, `CI_Z`, `AXIS_WIDTH`, `BAR_EDGE_WIDTH`, `ROTATE_X_MIN_CHARS` | `chartstyle` | **the single definition of the chart furniture** — resolution, figure sizes, the 95% interval every whisker draws, the bar outline weight, and the axis treatment |
 
 ---
 
@@ -925,12 +1017,27 @@ report text.
 Duplication that carried a correctness risk was consolidated: `palette.py` is now the single
 definition of the chart colours that three modules each held their own copy of under different
 role names, so a palette revision is one edit rather than three coordinated ones across four
-published figures. All four regenerate **byte-identically**, which is the proof the change was
-behaviour-preserving.
+published figures. All four regenerated **byte-identically**, which was the proof that *that* change
+was behaviour-preserving.
+
+> **Superseded, 2026-09-02.** The figures build replaced the palette values and restyled every
+> chart, so the four decile PNGs no longer regenerate byte-identically and that particular check no
+> longer applies — it was evidence for the consolidation, not a standing invariant. The consolidation
+> itself is what made the restyle one edit. The invariant that replaces it is narrower and stronger:
+> re-running `foreign_sales.py`, `decile_sort.py` and `fama_macbeth_pricing.py --force` leaves all
+> **nine** of their results CSVs and validation reports `cmp`-identical, and only the PNGs move. The
+> docstring's measured CVD ΔE was removed rather than restated, since it was true of the old values
+> and is not true of the new ones; see `build_notes.md` Step 9.
 
 The audit found **no dead code**: ~150 functions checked by AST load-reference, every one with a
 call site; zero commented-out blocks, zero unused imports, zero unused module constants, zero
 TODO/FIXME markers.
+
+> **Corrected, 2026-09-02.** The figures build re-ran that sweep and found one exception the audit
+> missed: **`decile_sort._listed` has no call site**, and `git show HEAD:decile_sort.py` confirms it
+> had none before either. Left in place and flagged rather than removed, since deleting it is a
+> hygiene fix unrelated to figures. Every other function, import and module constant in the eight
+> files that build touched is still referenced.
 
 ### Publication safety
 

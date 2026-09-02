@@ -46,6 +46,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+import chartstyle as cs
 import palette
 import clean_data as cd
 import clean_controls_data as ccd
@@ -139,10 +140,12 @@ THIN = "-" * 78
 
 # Two categorical hues for the two event legs, plus texture for the robustness variant of the
 # imposition leg - a secondary encoding rather than a third hue, because the robustness run is the
-# same event as the primary and differs only in estimation window. Slots 1 and 2 of the dataviz
-# reference palette; validated all-pairs on the light surface (CVD dE 24.7, normal-vision 33.6,
-# both above the >=8 / >=15 floors, and both above 3:1 contrast, so no relief obligation).
+# same event as the primary and differs only in estimation window. Slots 1 and 2 of palette.py;
+# the hatch is what separates the two imposition bars, so no pair here relies on hue alone.
 PALETTE = palette.roles(impose="CATEGORICAL_1", reverse="CATEGORICAL_2")
+# Distinguishes the trimmed universe in a chart title; the cutoff itself is in the report.
+EX_MEGACAP_NOTE = "excluding mega-caps"
+
 BAR_STYLE = {
     "imposition_primary": {"hatch": None, "color": "impose",
                            "label": "Imposition 2025-04-02, primary"},
@@ -151,11 +154,6 @@ BAR_STYLE = {
     "reversal_primary": {"hatch": None, "color": "reverse",
                          "label": "Reversal 2025-08-29"},
 }
-
-# Groups whose effective N (inverse Herfindahl of value weights) falls below this are named in a
-# chart footnote: at that concentration the bar restates one or two firms rather than the group,
-# and a reader should not take it as a statement about ~190 firms.
-CONCENTRATED_EFF_N = 6.0
 
 # Monotonicity verdict thresholds (report section 8). Both statistics enter every branch - see
 # monotonicity_reading - so a series cannot read as a stronger trend than one that is strictly
@@ -498,8 +496,7 @@ def effective_n(groups: pd.Series, weights: pd.DataFrame, event: str) -> pd.Seri
 
 
 def plot_groups(results: pd.DataFrame, path: Path = CHART_OUT,
-                eff_n: pd.Series | None = None, subtitle: str = "",
-                weighting: str = PRIMARY_WEIGHTING) -> Path:
+                weighting: str = PRIMARY_WEIGHTING, universe_note: str = "") -> Path:
     """Grouped bar chart: one panel per event window, three bars per TExp group.
 
     Two hues carry the two event legs; the imposition robustness run is the same hue as its
@@ -509,92 +506,50 @@ def plot_groups(results: pd.DataFrame, path: Path = CHART_OUT,
 
     One chart per (universe, weighting): the four together are the section 7.3 figure plus its
     concentration robustness in both directions. ``weighting`` selects which rows are drawn and
-    relabels the axes; nothing else differs between them, which is the point of drawing four.
+    relabels the axes, ``universe_note`` distinguishes the trimmed universe in the title; nothing
+    else differs between them, which is the point of drawing four.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
     scheme = next(w for w in WEIGHTINGS if w["name"] == weighting)
     adjective = scheme["adjective"]
     results = results[results["weighting"] == weighting]
     if results.empty:
         raise ValueError(f"no {weighting!r}-weighted rows to plot")
-    plt.rcParams["font.family"] = "serif"
+
+    cs.apply()
     windows = ec.CAR_COLUMNS
     runs = [r["name"] for r in ec.RUNS]
-
-    fig, axes = plt.subplots(len(windows), 1, figsize=(9.5, 10.5), dpi=300, sharey=True)
-    fig.patch.set_facecolor(PALETTE["surface"])
+    fig, axes = plt.subplots(len(windows), 1, figsize=cs.SIZE_STACK3, sharey=True)
 
     slot = 0.26                      # centre-to-centre spacing of the three bars in a cluster
-    width = 0.24                     # leaves a ~2px surface gap between adjacent fills
+    width = 0.24                     # leaves a hairline gap between adjacent fills
     offsets = {run: (i - 1) * slot for i, run in enumerate(runs)}
     x = np.arange(len(GROUPS))
 
     for ax, window in zip(axes, windows):
-        ax.set_facecolor(PALETTE["surface"])
         for run in runs:
             style = BAR_STYLE[run]
             cell = results[(results["run"] == run) & (results["window"] == window)]
             height = cell.set_index("group")["vw_car"].reindex(GROUPS) * 100
             ax.bar(x + offsets[run], height, width, label=style["label"],
                    facecolor=PALETTE[style["color"]], hatch=style["hatch"],
-                   edgecolor=PALETTE["surface"], linewidth=0.8, zorder=3)
-
-        ax.axhline(0, color=PALETTE["ink_muted"], lw=1.0, zorder=4)
-        ax.set_title(f"Event window {_short(window)}", fontsize=10, color=PALETTE["ink"],
-                     pad=8, loc="left")
-        ax.set_ylabel(f"{adjective} CAR (%)", fontsize=9,
-                      color=PALETTE["ink_muted"], labelpad=8)
+                   edgecolor=palette.INK, linewidth=cs.BAR_EDGE_WIDTH, zorder=3)
+        cs.zero_line(ax)
+        cs.panel_title(ax, f"Event window {_short(window)}")
         ax.set_xticks(x, [str(g) for g in GROUPS])
-        ax.tick_params(labelsize=8, colors=PALETTE["ink_muted"])
-        ax.grid(axis="y", color=PALETTE["grid"], lw=0.6)
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color(PALETTE["grid"])
 
-    axes[-1].set_xlabel("TExp group  (0 = zero exposure, 1-9 = ascending exposure deciles)",
-                        fontsize=9, color=PALETTE["ink_muted"], labelpad=10)
-    fig.suptitle(f"{adjective} cumulative abnormal return by tariff-exposure group",
-                 fontsize=12, color=PALETTE["ink"], x=0.055, ha="left", y=0.992)
-    if subtitle:
-        fig.text(0.055, 0.966, subtitle, fontsize=8.5, color=PALETTE["ink_muted"], ha="left")
-    # Legend above the panels, not inside one: at this bar density any in-axes placement sits on
-    # top of data in at least one window.
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="upper left", bbox_to_anchor=(0.05, 0.955),
-               fontsize=8, frameon=False, labelcolor=PALETTE["ink_muted"], ncol=3,
-               columnspacing=1.6, handlelength=1.4)
+    axes[len(axes) // 2].set_ylabel(f"{adjective} cumulative abnormal return (%)")
+    axes[-1].set_xlabel("TExp group  (0 = zero exposure, 1-9 = ascending exposure deciles)")
+    cs.headroom(axes[0], top=0.18)
+    cs.legend(axes[0], loc="upper right")
+    for ax in axes:
+        cs.frame(ax, rotate_x=False)
 
-    if weighting != PRIMARY_WEIGHTING:
-        entering = (results[results["window"] == REFERENCE_WINDOW]
-                    .groupby("group")["n_entering"].max())
-        note = (f"Equal weighting gives every entering firm the same influence, so effective firm "
-                f"count equals the entering count exactly: {entering.min():,} to "
-                f"{entering.max():,} across groups.\nCompare the value-weighted chart, where "
-                f"several bars restate a handful of mega-caps - that contrast, not either chart "
-                f"alone, is v5 section 8's\nequal-versus-value robustness. Per-group figures are "
-                f"in the validation report.")
-        fig.text(0.055, 0.012, note, fontsize=7.5, color=PALETTE["ink_muted"], ha="left",
-                 va="bottom", linespacing=1.5)
-    elif eff_n is not None:
-        thin = [f"{int(g)} (~{eff_n[g]:.0f} firms)" for g in GROUPS
-                if g in eff_n.index and eff_n[g] < CONCENTRATED_EFF_N]
-        note = ("Value weighting concentrates several groups in a few mega-caps. Effective firm "
-                "count (inverse Herfindahl of weights) is lowest in group "
-                + ", ".join(thin) + ";\nthose bars restate their largest holdings rather than the "
-                "~190 firms nominally in the group. Per-group figures are in the validation "
-                "report." if thin else
-                f"Effective firm count (inverse Herfindahl of value weights) runs "
-                f"{eff_n.min():.0f} to {eff_n.max():.0f} across groups, so no bar is carried by a "
-                f"handful of firms.\nPer-group figures, and the comparison against the all-firms "
-                f"universe, are in the validation report.")
-        fig.text(0.055, 0.012, note, fontsize=7.5, color=PALETTE["ink_muted"], ha="left",
-                 va="bottom", linespacing=1.5)
-
-    fig.tight_layout(rect=(0, 0.045, 1, 0.938))
-    fig.savefig(path, facecolor=PALETTE["surface"])
-    plt.close(fig)
-    return path
+    # "CAR" rather than the phrase spelled out: four charts differ only in weighting and universe,
+    # so both must fit in the title, and the y-axis label expands the abbreviation on every one.
+    title = f"{adjective} CAR by tariff-exposure group"
+    cs.figure_title(fig, f"{title}, {universe_note}" if universe_note else title)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return cs.save(fig, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -1120,10 +1075,8 @@ def main() -> pd.DataFrame:
     results, wstats = group_car(cars, groups, universe, weights)
 
     write_results(results)
-    subtitle_a = (f"All {len(universe):,} firms passing the section 6 screen at end-March 2025")
-    plot_groups(results, eff_n=effective_n(groups, weights, ec.RUNS[0]["event"]),
-                subtitle=subtitle_a)
-    plot_groups(results, RESULTS_EW_CHART, subtitle=subtitle_a, weighting="equal")
+    plot_groups(results)
+    plot_groups(results, RESULTS_EW_CHART, weighting="equal")
 
     # --- Universe B: the same procedure on an independently built group set -- #
     trimmed, tstats = trim_megacaps(universe, weights)
@@ -1131,13 +1084,9 @@ def main() -> pd.DataFrame:
     tresults, twstats = group_car(cars, tgroups, trimmed, weights)
 
     write_results(tresults, RESULTS_EX_OUT)
-    subtitle_b = (f"Robustness: excluding the {tstats['n_dropped']} firms above the NYSE "
-                  f"90th-percentile market equity at {TRIM_MONTH} "
-                  f"(${tstats['cutoff'] / 1e6:,.0f}bn) - {len(trimmed):,} firms")
-    plot_groups(tresults, CHART_EX_OUT,
-                eff_n=effective_n(tgroups, weights, ec.RUNS[0]["event"]),
-                subtitle=subtitle_b)
-    plot_groups(tresults, RESULTS_EW_CHART_EX, subtitle=subtitle_b, weighting="equal")
+    plot_groups(tresults, CHART_EX_OUT, universe_note=EX_MEGACAP_NOTE)
+    plot_groups(tresults, RESULTS_EW_CHART_EX, weighting="equal",
+                universe_note=EX_MEGACAP_NOTE)
 
     validate(results, groups, universe, breakpoints, funnel, gstats, cars, weights,
              weight_days=weight_days, wstats=wstats,
