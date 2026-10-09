@@ -1,7 +1,7 @@
 # Is Tariff Exposure Priced?
 
 Code for an MSFE dissertation. It measures how exposed each US-listed firm is to tariffs from the
-text of its annual report, then tests whether that exposure is reflected in stock prices:
+text of its annual report, then tests whether that exposure is reflected in returns:
 
 - **Exposure (TExp):** the share of sentences in a 10-K's *Item 1A Risk Factors* section that
   mention a tariff or trade-policy term. It is scored from the filing available before each date
@@ -187,10 +187,3 @@ Everything lands in `output/`:
   autocorrelation consistent covariance matrix. *Econometrica*, 55(3), 703–708.
 - White, H. (1980). A heteroskedasticity-consistent covariance matrix estimator and a direct test
   for heteroskedasticity. *Econometrica*, 48(4), 817–838.
-
-The tariff term list (`src/bigram_list.json`) and the code are the author's own.
-
-## License
-
-No license is granted: all rights reserved. You may view the code, but reuse requires the author's
-permission. The data sources above are subject to their own terms.
