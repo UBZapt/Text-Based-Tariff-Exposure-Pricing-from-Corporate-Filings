@@ -21,8 +21,11 @@
 *.txt
 !requirements.txt
 
-# Raw inputs, cached SEC filings and every derived panel live under data/
-data/
+# Raw inputs, cached SEC filings and every derived panel live under data/. The folder skeleton is
+# tracked through .gitkeep files; everything inside it stays local.
+data/**
+!data/**/
+!data/**/.gitkeep
 
 # --- Local notes, documents and assistant instruction files (README.md is the only markdown) ---
 *.md
@@ -60,8 +63,9 @@ id_rsa
 .cursorrules
 .vscode/
 
-# --- Generated results ---
-output/
+# --- Generated results (the folder itself is tracked through .gitkeep) ---
+output/*
+!output/.gitkeep
 logs/*.tmp
 logs/
 

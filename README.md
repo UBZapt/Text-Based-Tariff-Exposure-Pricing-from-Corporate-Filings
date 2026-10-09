@@ -22,13 +22,16 @@ text of its annual report, then tests whether that exposure is reflected in retu
 │   ├── config.py          every input and output directory, defined once
 │   ├── bigram_list.json   the tariff term list
 │   └── *.py               one module per pipeline stage
-├── data/                  not tracked: your inputs and everything derived from them
-│   ├── raw/               the input files listed below
+├── data/                  your inputs and everything derived from them
+│   ├── raw/               put the input files listed below here
 │   ├── filings/           downloaded 10-Ks, cleaned text, SEC metadata cache
 │   ├── clean/             cleaned panels and exposure scores
 │   └── intermediate/      analysis panels and per-firm abnormal returns
-└── output/                not tracked: results tables, figures and validation reports
+└── output/                results tables, figures and validation reports
 ```
+
+The folders are part of the repository, but their contents are not: data files stay on your
+machine, and the pipeline fills `data/` and `output/` as it runs.
 
 ## Requirements
 
@@ -104,7 +107,7 @@ Code comments refer to stages by section number (§) and to the hypotheses below
 | `texp_panel` | `build_texp_panel.py` | One score per firm per date, standardised within date. | 7.1 |
 | `foreign_sales` | `foreign_sales.py` | Foreign-sales share from Compustat segments, and its correlation with TExp. | 7.1 |
 | `controls_*`, `car_*` | `clean_controls_data.py`, `estimate_car.py` | Daily panel with size, book-to-market, leverage, momentum and industry; FF5 + momentum abnormal returns and CARs over [−1,+1], [−5,+5] and [−10,+10] days. | 7.2, 7.6 |
-| `regression_*` | `run_car_regression.py` | Regresses CAR on TExp with controls and industry effects. Tests the sign flip between legs (H1) and stability across cycles (H4). | 7.2, 7.6 |
+| `regression_*` | `run_car_regression.py` | Regresses CAR on TExp with controls and industry effects. Tests the sign flip between legs (H1), stability across cycles (H4) and robustness to foreign sales and industry (H5). | 7.2, 7.6 |
 | `decile_sort` | `decile_sort.py` | Average CAR by exposure group. Descriptive only. | 7.3 |
 | `fm_panel`, `fama_macbeth` | `build_fm_panel.py`, `fama_macbeth_pricing.py` | Monthly Fama–MacBeth regressions of returns on TExp (H2, H5), split by uncertainty regime (H3). | 7.4, 7.5 |
 | `figures_*`, `workbook` | `figures_*.py`, `build_results_workbook.py` | Figures and a single Excel workbook of every results table. | – |
@@ -118,11 +121,11 @@ Event dates are defined once, in `CYCLES` in `src/clean_controls_data.py`.
 
 | Label | Prediction |
 | --- | --- |
-| H1 | Exposed firms fall on the imposition and recover on the reversal (the coefficient flips sign). |
-| H2 | Exposure carries an unconditional monthly return premium. |
-| H3 | That premium is larger when policy uncertainty is high. H3b: the event reaction builds across wider windows. |
-| H4 | The 2025 relation holds in the 2018–19 cycle. |
-| H5 | The premium is not explained by foreign sales or industry. |
+| H1 | The exposure coefficient is higher on the reversal than on the imposition (δ = b_reversal − b_imposition > 0): exposed firms fall when tariffs are imposed and recover when they are struck down. |
+| H2 | Exposure predicts ordinary monthly returns: the average Fama–MacBeth slope is non-zero. |
+| H3 | The premium is present when policy uncertainty is high (above the index's 75th percentile) and absent otherwise. H3b: the reversal is priced gradually, so its effect builds across the wider windows. |
+| H4 | The 2018–19 coefficients carry the same sign as 2025, and the difference between cycles is not distinguishable from zero. |
+| H5 | The exposure coefficient survives controls for foreign-sales share and FF12 industry effects. |
 
 ## Outputs
 
@@ -160,15 +163,17 @@ Everything lands in `output/`:
 **Methods**
 
 - Amiti, M., Kong, S. H., & Weinstein, D. (2020). *The effect of the US–China trade war on US
-  investment* (NBER Working Paper No. 27114). National Bureau of Economic Research.
-  https://doi.org/10.3386/w27114. Original source of the 2018–19 event dates.
+  investment* (NBER Working Paper No. 27114). National Bureau of Economic Research. Original
+  source of the 2018–19 event dates.
 - Baker, S. R., Bloom, N., & Davis, S. J. (2016). Measuring economic policy uncertainty.
   *Quarterly Journal of Economics*, 131(4), 1593–1636.
 - Bird, S., Klein, E., & Loper, E. (2009). *Natural Language Processing with Python*. O'Reilly.
   (NLTK, used for sentence splitting.)
+- Blume, M. E., & Stambaugh, R. F. (1983). Biases in computed returns: An application to the size
+  effect. *Journal of Financial Economics*, 12(3), 387–404. The $1 price screen.
 - Bruno, G., Goltz, F., & Luyten, B. (2024). Firm-level exposure to trade policy shocks: A
   multidimensional measurement approach. *European Financial Management*, 30(4), 2135–2163.
-  https://doi.org/10.1111/eufm.12473. Table 3: the 2018–19 event dates.
+  Table 3: the 2018–19 event dates.
 - Cameron, A. C., Gelbach, J. B., & Miller, D. L. (2011). Robust inference with multiway
   clustering. *Journal of Business & Economic Statistics*, 29(2), 238–249.
 - Campbell, J. L., Chen, H., Dhaliwal, D. S., Lu, H., & Steele, L. B. (2014). The information
@@ -178,13 +183,24 @@ Everything lands in `output/`:
   57–82.
 - Davis, J. L., Fama, E. F., & French, K. R. (2000). Characteristics, covariances, and average
   returns: 1929 to 1997. *Journal of Finance*, 55(1), 389–406. Book-equity definition.
+- Fama, E. F., & French, K. R. (2008). Dissecting anomalies. *Journal of Finance*, 63(4),
+  1653–1678. The NYSE micro-cap screen.
 - Fama, E. F., & French, K. R. (2015). A five-factor asset pricing model. *Journal of Financial
   Economics*, 116(1), 1–22.
 - Fama, E. F., & MacBeth, J. D. (1973). Risk, return, and equilibrium: Empirical tests. *Journal
   of Political Economy*, 81(3), 607–636.
+- Federal Circuit (2025). *V.O.S. Selections, Inc. v. Trump*, No. 25-1812, August 29. US Court of
+  Appeals for the Federal Circuit. The 2025 reversal event.
+- Gelman, A., & Stern, H. (2006). The difference between "significant" and "not significant" is
+  not itself statistically significant. *The American Statistician*, 60(4), 328–331. Why H1 is
+  tested on the difference between legs.
 - Hassan, T. A., Hollander, S., van Lent, L., & Tahoun, A. (2019). Firm-level political risk:
   Measurement and effects. *Quarterly Journal of Economics*, 134(4), 2135–2202. The
   sentence-level, length-scaled construction TExp follows.
+- Hou, K., Xue, C., & Zhang, L. (2020). Replicating anomalies. *Review of Financial Studies*,
+  33(5), 2019–2112. NYSE breakpoints for the size screens.
+- Jegadeesh, N., & Titman, S. (1993). Returns to buying winners and selling losers: Implications
+  for stock market efficiency. *Journal of Finance*, 48(1), 65–91. The $1 price screen.
 - Loughran, T., & McDonald, B. (2016). Textual analysis in accounting and finance: A survey.
   *Journal of Accounting Research*, 54(4), 1187–1230. 10-K parsing conventions.
 - MacKinlay, A. C. (1997). Event studies in economics and finance. *Journal of Economic
@@ -193,3 +209,6 @@ Everything lands in `output/`:
   autocorrelation consistent covariance matrix. *Econometrica*, 55(3), 703–708.
 - White, H. (1980). A heteroskedasticity-consistent covariance matrix estimator and a direct test
   for heteroskedasticity. *Econometrica*, 48(4), 817–838.
+- Zellner, A. (1962). An efficient method of estimating seemingly unrelated regressions and tests
+  for aggregation bias. *Journal of the American Statistical Association*, 57(298), 348–368. The
+  stacked system behind the H1 and H4 difference tests.
