@@ -7,7 +7,7 @@ text of its annual report, then tests whether that exposure is reflected in retu
   mention a tariff or trade-policy term. It is scored from the filing available before each date
   studied.
 - **Event study:** abnormal returns around the April 2025 tariff imposition and the August 2025
-  court ruling against it, repeated out of sample on the 2018–19 Section 301 escalations.
+  court ruling against it, repeated out of sample on the 2018–19 US–China trade war.
 - **Pricing tests:** a decile sort of event returns, and monthly Fama–MacBeth regressions over
   2018–2025, split by economic policy uncertainty.
 
@@ -110,9 +110,11 @@ Code comments refer to stages by section number (§) and to the hypotheses below
 | `figures_*`, `workbook` | `figures_*.py`, `build_results_workbook.py` | Figures and a single Excel workbook of every results table. | – |
 
 The `_2025` stages cover the 2025 events: tariff imposition on 2025-04-02 and the Federal Circuit
-ruling on 2025-08-29. The `_cc` stages cover the 2018–19 cycle: seven Section 301 escalations, as
-dated by Bruno, Goltz and Luyten (2024, Table 3), plus de-escalations on 2019-10-11 and
-2020-01-15. Event dates are defined once, in `CYCLES` in `src/clean_controls_data.py`.
+ruling on 2025-08-29. The `_cc` stages cover the 2018–19 US–China trade war (labelled the Section
+301 cycle in code and figures). It has seven escalation events, US tariff announcements and Chinese
+retaliation, taken as published from Table 3 of Bruno, Goltz and Luyten (2024), who source them from
+Amiti, Kong and Weinstein (2020). Two de-escalations are added, on 2019-10-11 and 2020-01-15.
+Event dates are defined once, in `CYCLES` in `src/clean_controls_data.py`.
 
 | Label | Prediction |
 | --- | --- |
@@ -157,12 +159,16 @@ Everything lands in `output/`:
 
 **Methods**
 
+- Amiti, M., Kong, S. H., & Weinstein, D. (2020). *The effect of the US–China trade war on US
+  investment* (NBER Working Paper No. 27114). National Bureau of Economic Research.
+  https://doi.org/10.3386/w27114. Original source of the 2018–19 event dates.
 - Baker, S. R., Bloom, N., & Davis, S. J. (2016). Measuring economic policy uncertainty.
   *Quarterly Journal of Economics*, 131(4), 1593–1636.
 - Bird, S., Klein, E., & Loper, E. (2009). *Natural Language Processing with Python*. O'Reilly.
   (NLTK, used for sentence splitting.)
-- Bruno, Goltz and Luyten (2024). *European Financial Management*. Table 3: Section 301 escalation
-  dates.
+- Bruno, G., Goltz, F., & Luyten, B. (2024). Firm-level exposure to trade policy shocks: A
+  multidimensional measurement approach. *European Financial Management*, 30(4), 2135–2163.
+  https://doi.org/10.1111/eufm.12473. Table 3: the 2018–19 event dates.
 - Cameron, A. C., Gelbach, J. B., & Miller, D. L. (2011). Robust inference with multiway
   clustering. *Journal of Business & Economic Statistics*, 29(2), 238–249.
 - Campbell, J. L., Chen, H., Dhaliwal, D. S., Lu, H., & Steele, L. B. (2014). The information

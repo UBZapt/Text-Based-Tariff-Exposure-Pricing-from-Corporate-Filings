@@ -140,9 +140,10 @@ SCOPES = {"full": None, "subsample": SAMPLE_CSV}
 # December-FY firm gets its FY(y-1) 10-K filed in Feb/Mar of year y.
 FULL_PANEL_DATES = [f"{year}-04-02" for year in range(2017, 2026)]
 
-# Cross-cycle event pull, section 7.6. Seven Section 301 escalations from Bruno, Goltz & Luyten
-# (2024) Table 3, used exactly as published so the event-date selection carries no discretion,
-# plus the two reversal dates: 2019-10-11 (primary) and 2020-01-15 (Phase One, robustness).
+# Cross-cycle event pull, section 7.6. Seven trade-war escalations from Bruno, Goltz & Luyten
+# (2024) Table 3 (sourced from Amiti, Kong & Weinstein 2020), used exactly as published so the
+# event-date selection carries no discretion, plus the two reversal dates: 2019-10-11 (primary)
+# and 2020-01-15 (Phase One, robustness).
 CROSS_CYCLE_DATES = ["2018-03-01", "2018-03-22", "2018-04-02", "2018-06-15", "2018-09-17",
                      "2019-05-10", "2019-08-23", "2019-10-11", "2020-01-15"]
 

@@ -63,7 +63,8 @@ MONTHLY_CSV = CLEAN_DIR / "clean_returns.csv"
 #                  by construction.
 #   suffix         appended to every output filename.
 CROSS_CYCLE_EVENTS = {
-    # Section 301 escalations, Bruno, Goltz & Luyten (2024) Table 3, used exactly as published.
+    # Trade-war escalations (US tariffs and Chinese retaliation), Bruno, Goltz & Luyten (2024)
+    # Table 3, used exactly as published; they take the dates from Amiti, Kong & Weinstein (2020).
     "escalate_20180301": "2018-03-01",
     "escalate_20180322": "2018-03-22",
     "escalate_20180402": "2018-04-02",
