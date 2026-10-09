@@ -13,8 +13,8 @@ refuses to overwrite an existing sample without --redraw.
 The subsample applies to sections 7.4 and 7.5 only. The event study (7.2) and the cross-cycle
 validation (7.6) run on the full universe.
 
-    python sample_full_panel_firms.py
-    python sample_full_panel_firms.py --redraw     # only to deliberately replace the draw
+    python src/sample_full_panel_firms.py
+    python src/sample_full_panel_firms.py --redraw     # only to deliberately replace the draw
 """
 
 import argparse
@@ -27,12 +27,11 @@ import pandas as pd
 import run_report
 
 import persist_2025_universe as pu
+from config import BASE, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
 
 UNIVERSE_CSV = pu.UNIVERSE_OUT
 SAMPLE_OUT = OUTPUT_DIR / "full_panel_firm_sample.csv"
@@ -90,7 +89,7 @@ def write_sample(sample: pd.DataFrame, n_universe: int, seed: int = SEED,
     The seed lives in the file itself, not only in this module, so the artefact is
     self-describing if it is ever read without the code. Readers must pass comment='#'.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     header = (f"# full-panel firm subsample - Research Design v6 section 7.0\n"
               f"# seed={seed} draw_date={date.today().isoformat()} "
               f"N={n_universe} n={len(sample)}\n"
@@ -169,8 +168,8 @@ def print_assumptions() -> None:
         f"step already owns.",
         f"Enumeration order = ascending {ORDER_COLUMN}, recorded so the index-to-firm mapping is "
         f"reproducible from the universe file alone.",
-        f"Seed = {SEED}, fixed and recorded here, in the output file header, in build_notes.md "
-        f"and in CLAUDE.md. Draw is without replacement, so the {SAMPLE_SIZE:,} firms are distinct.",
+        f"Seed = {SEED}, fixed and recorded here, in the output file header and in README.md. "
+        f"Draw is without replacement, so the {SAMPLE_SIZE:,} firms are distinct.",
         "The draw is made ONCE and reused unchanged across all ten annual reference dates. "
         "Redrawing per year would create artificial entry and exit unrelated to any economic "
         "process (section 7.0 step 3), so an existing sample file is never silently overwritten.",

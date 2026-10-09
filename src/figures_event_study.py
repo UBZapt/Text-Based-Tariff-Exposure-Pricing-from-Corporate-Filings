@@ -6,7 +6,7 @@ than from any recomputation of them - with one exception that is guarded rather 
 within-industry estimates are a table because as a chart they carried thirty-six intervals, most
 several times the width of their point, and said only that nothing is precisely estimated inside
 an industry; a table of coefficients and standard errors says that checkably. The event-time
-trajectory needs abnormal returns day by day, and `intermediate/car_*.csv` holds only the three
+trajectory needs abnormal returns day by day, and `data/intermediate/car_*.csv` holds only the three
 cumulative CARs, so the daily ARs are rebuilt here through `estimate_car`'s own public functions.
 Every piece of estimation logic stays in that module; this script contributes the assembly and
 then asserts that the CARs it can re-derive reproduce the persisted tables exactly. If that glue
@@ -33,11 +33,9 @@ import decile_sort as ds
 import estimate_car as ec
 import palette
 import run_car_regression as rcr
+from config import BASE, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- Configuration
-
-BASE = ec.BASE
-OUTPUT_DIR = BASE / "output"
 
 REGRESSION_CSV = OUTPUT_DIR / "car_regression_results.csv"
 CROSS_CYCLE_CSV = OUTPUT_DIR / "car_regression_results_cross_cycle.csv"
@@ -410,7 +408,7 @@ def industry_table(ind: pd.DataFrame, event_date: str) -> list[str]:
 
 def write_industry_table(ind: pd.DataFrame, event_date: str, path=TABLE_INDUSTRY) -> Path:
     """Write the industry table as fixed-width text, titled as the figure it replaces."""
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     title = "Tariff-exposure coefficient within each industry group"
     lines = [title, "=" * len(title), ""] + industry_table(ind, event_date)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

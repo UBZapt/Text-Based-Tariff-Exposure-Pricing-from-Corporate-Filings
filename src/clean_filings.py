@@ -6,18 +6,21 @@ financial tables and repeated page furniture, and splits each filing's prose int
 Item 1A ("Risk Factors") and everything else. Paragraph boundaries are preserved so
 the downstream sentence tokeniser is not corrupted.
 
+Parsing follows the 10-K parsing conventions set out in Loughran and McDonald (2016), and the
+Item 1A extraction follows the approach of Campbell et al. (2014); full references in README.md.
+
 Cleaning only: no sentence splitting, tokenisation, lowercasing, stopword removal,
 deduplication, bigram or keyword logic (those belong to the tokenisation and scoring
 steps).
 
 Keyed on the document, not the pull row. Across 17 reference dates the pull log's 31,142
 successful rows cover 13,983 distinct firm-documents, so each accession is parsed once and
-shared by every reference date that selected it. Cleaned text goes to clean_text/ as one
+shared by every reference date that selected it. Cleaned text goes to data/filings/clean_text/ as one
 gzipped file per accession; clean_filings.csv carries metadata only. Both are append-only and
 flushed per document, so an interrupted run resumes and loses at most one filing.
 
-    python clean_filings.py             # clean whatever is outstanding
-    python clean_filings.py --status    # done/remaining, no work, no network
+    python src/clean_filings.py             # clean whatever is outstanding
+    python src/clean_filings.py --status    # done/remaining, no work, no network
 """
 
 import argparse
@@ -35,6 +38,7 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 import edgar_pull
 import run_report
+from config import BASE, CLEAN_DIR, CLEAN_TEXT_DIR, EDGAR_LOG as LOG_CSV, FILINGS_DIR, OUTPUT_DIR
 
 # Inline-XBRL filings carry an XML declaration but are parsed as HTML deliberately:
 # the HTML tree builder is what tolerates the malformed markup these documents contain.
@@ -43,25 +47,15 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
-LOG_CSV = BASE / "edgar_pull_log.csv"
-FILINGS_DIR = BASE / "filings_raw"     # must match edgar_pull.FILINGS_DIR
 CLEAN_OUT = CLEAN_DIR / "clean_filings.csv"
-# The per-filing audit table this used to write to output/cleaning_diagnostics.csv was
-# byte-for-byte identical to clean_data/clean_filings.csv - write_diagnostics wrote the whole
-# cleaned table, whose schema already IS the diagnostics schema - and nothing read it. Removed;
-# the run record it was standing in for is now a real report.
 REPORT_OUT = OUTPUT_DIR / "filing_cleaning_validation_report.txt"
-# One gzipped {item_1a, rest} document per accession. The text lives here rather than in
-# CLEAN_OUT because the full corpus is ~380 KB of prose per filing: as columns that is a
+# Cleaned text is stored in CLEAN_TEXT_DIR, one gzipped {item_1a, rest} document per accession,
+# rather than in CLEAN_OUT: the full corpus is ~380 KB of prose per filing, so as columns it is a
 # ~5.3 GB CSV which cannot be built or re-read without exhausting memory, while per-accession
 # files keep both cleaning and scoring at constant memory and make either stage resumable.
-CLEAN_TEXT_DIR = BASE / "clean_text"
 
 # CSV rather than Parquet: Windows Smart App Control (Enforcement) blocks pyarrow's unsigned
-# native DLLs, so no Parquet file on this machine can be read. See build_notes.md Step 4b.
+# native DLLs, so Parquet files could not be read on the machine this was built on.
 # Identifier columns must be read back as strings or their zero padding is silently lost, and
 # the flag column must not become NaN when a filing legitimately holds an empty string.
 READ_DTYPES = {"cik": str, "accession": str, "form_type": str, "filing_date": str,
@@ -125,7 +119,7 @@ def write_clean_text(accession: str, item_1a: str, rest: str) -> Path:
     edgar_pull.download_primary gives the raw cache. Reuses edgar_pull's replace helper
     because OneDrive briefly locks files it is uploading.
     """
-    CLEAN_TEXT_DIR.mkdir(exist_ok=True)
+    CLEAN_TEXT_DIR.mkdir(parents=True, exist_ok=True)
     path = text_path(accession)
     tmp = path.with_suffix(".part")
     with gzip.open(tmp, "wt", encoding="utf-8") as fh:
@@ -324,7 +318,7 @@ def open_clean_log():
     re-running resumes. The end-of-run single write this replaced discarded the whole run,
     and at full-corpus scale it also had to hold ~5 GB of prose in memory to do it.
     """
-    CLEAN_DIR.mkdir(exist_ok=True)
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
     is_new = not CLEAN_OUT.exists() or CLEAN_OUT.stat().st_size == 0
     fh = CLEAN_OUT.open("a", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")

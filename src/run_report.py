@@ -73,6 +73,6 @@ def capture(path: Path, title: str = "", header: list[str] | None = None):
                  f"Generated     : {stamp}"]
         lines += header or []
         lines += ["", "".join(buffer).rstrip("\n"), ""]
-        path.parent.mkdir(exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines), encoding="utf-8")
         print(f"Report written to {path.name}")

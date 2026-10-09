@@ -16,32 +16,29 @@ No text parsing, tokenization, or scoring is performed here (that is Step 2).
 import io
 import re
 import argparse
-from pathlib import Path
 
 import pandas as pd
 
 import run_report
+from config import CLEAN_DIR, OUTPUT_DIR, RAW_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
 REPORT_OUT = OUTPUT_DIR / "source_cleaning_validation_report.txt"
-CLEAN_DIR = BASE / "clean_data"               # cleaned panels consumed downstream
-CRSP_FILE = BASE / "Monthly Returns.csv"
-LINK_FILE = BASE / "PERMNO - GVKEY - CIK.csv"
-GEO_FILE = BASE / "Compustat Geographic segment data.csv"  # not touched in this task
-FF_FILE = BASE / "FF5_MOM_Factors.csv"
-EPU_FILE = BASE / "US_Policy_Uncertainty_Data.xlsx"
-ME_BP_FILE = BASE / "ME_Breakpoints.csv"      # Ken French NYSE ME breakpoints
+CRSP_FILE = RAW_DIR / "Monthly Returns.csv"
+LINK_FILE = RAW_DIR / "PERMNO - GVKEY - CIK.csv"
+GEO_FILE = RAW_DIR / "Compustat Geographic segment data.csv"  # date-checked here; read by foreign_sales
+FF_FILE = RAW_DIR / "FF5_MOM_Factors.csv"
+EPU_FILE = RAW_DIR / "US_Policy_Uncertainty_Data.xlsx"
+ME_BP_FILE = RAW_DIR / "ME_Breakpoints.csv"      # Ken French NYSE ME breakpoints
 BRIDGE_OUT = CLEAN_DIR / "clean_firm_bridge.csv"
 RETURNS_OUT = CLEAN_DIR / "clean_returns.csv"
 FF_OUT = CLEAN_DIR / "clean_ff5_mom.csv"
 EPU_OUT = CLEAN_DIR / "clean_epu.csv"
 
 EPU_SHEET = "Main News Index"                 # sheet holding the chosen EPU series
-EPU_VALUE_COL = "News_Based_Policy_Uncert_Index"  # chosen EPU variant (user decision)
+EPU_VALUE_COL = "News_Based_Policy_Uncert_Index"  # chosen EPU variant
 
 REFERENCE_DATE = pd.Timestamp("2025-04-02")  # "Liberation Day" tariffs
 PRICE_MIN = 1.0                              # keep price > $1
@@ -436,7 +433,7 @@ def clean_epu() -> pd.DataFrame:
     variants = {s: [c for c in xl.parse(s, nrows=0).columns
                     if c not in ("Year", "Month")] for s in xl.sheet_names}
     _note(f"[info] EPU variants present (not silently picked): {variants}. "
-          f"Chosen = '{EPU_VALUE_COL}' from '{EPU_SHEET}' (user decision); "
+          f"Chosen = '{EPU_VALUE_COL}' from '{EPU_SHEET}'; "
           f"no trade-policy sub-index exists in this file.")
 
     df = xl.parse(EPU_SHEET)
@@ -493,7 +490,7 @@ def print_assumptions() -> None:
         "FF5+MOM values are decimals (not percent) - no /100 conversion; no missing sentinels present.",
         "clean_ff5_mom retains rf (risk-free) for excess-return computation in estimate_car; "
         "v6 retires the Sharpe ratio the v5 design also cited it for.",
-        "EPU = News-Based index (Main News Index sheet) per user decision; "
+        "EPU = News-Based index (Main News Index sheet); "
         "other variants reported, not silently dropped.",
     ]:
         print(f"  - {line}")
@@ -537,7 +534,7 @@ def main(argv: list[str] | None = None) -> pd.DataFrame | None:
 
 
 def _run() -> pd.DataFrame:
-    CLEAN_DIR.mkdir(exist_ok=True)
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
     inspect_dates()
     crsp = load_crsp()
     ce = filter_common_equity(crsp)

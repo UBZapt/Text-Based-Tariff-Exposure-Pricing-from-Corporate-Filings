@@ -3,12 +3,14 @@ Step 2b - Sentence tokenisation (Stage 2) and tariff-bigram scoring (Stage 3).
 
 Reads the cleaned filings table, splits each filing's Item 1A and rest-of-document text
 into sentences, matches a fixed tariff term list against every sentence, and writes three
-exposure scores per filing plus their cross-sectional standardisations.
+raw exposure scores per filing.
 
-Measure formula, from research design section 7.1 with the relevance weight w_b dropped
-per instruction (the single deviation):
+Measure formula (section 7.1), with no per-term relevance weight:
 
     TExp = (sentences containing >= 1 tariff term) / (total sentences in that unit)
+
+This is the sentence-level, length-scaled construction Hassan et al. (2019) apply to political
+risk, applied here to a fixed tariff and trade-policy term list; full reference in README.md.
 
 The two stages are deliberately separate: ``tokenise_filing`` holds no matching logic and
 ``score_section`` holds no sentence-splitting logic. They are driven from one streaming loop
@@ -19,9 +21,9 @@ Keyed on the document. Scores are raw only; the cross-sectional standardisation 
 reference date, which this table has no column for, so it lives in build_texp_panel.py. Rows
 are flushed as each filing finishes, so an interrupted run resumes.
 
-    python score_filings.py                  # whole universe
-    python score_filings.py --n-ciks 50      # first N distinct CIKs by PERMNO
-    python score_filings.py --status         # done/remaining, no work
+    python src/score_filings.py                  # whole universe
+    python src/score_filings.py --n-ciks 50      # first N distinct CIKs by PERMNO
+    python src/score_filings.py --status         # done/remaining, no work
 """
 
 import argparse
@@ -40,17 +42,13 @@ import pandas as pd
 import clean_filings
 import edgar_pull
 import run_report
+from config import BASE, CLEAN_DIR, INTERMEDIATE_DIR, LEXICON as BIGRAM_JSON, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
-BIGRAM_JSON = BASE / "bigram_list.json"
 SCORES_OUT = CLEAN_DIR / "tariff_scores.csv"
 # The cleaned-filings path and its read dtypes are owned by clean_filings, which writes it.
-INTERMEDIATE_DIR = BASE / "intermediate"   # per-document audit table, not a reported result
 DIAG_OUT = INTERMEDIATE_DIR / "scoring_diagnostics.csv"
 TERM_HITS_OUT = OUTPUT_DIR / "term_hits.csv"
 REPORT_OUT = OUTPUT_DIR / "scoring_validation_report.txt"
@@ -210,7 +208,7 @@ def resolve_scope_ciks(n_ciks: int | None) -> set[str]:
     from. It must NOT be the set resolved at one reference date: _resolve_cik picks one link
     row per date, so a firm linked in 2018 but not in 2025 would be dropped as
     'cik_outside_universe' purely because of when the scope was evaluated. This is the same
-    trap CLAUDE.md records for prune_stale, which is why bridge_ciks() exists.
+    trap edgar_pull.prune_stale guards against, which is why bridge_ciks() exists.
     """
     if n_ciks is None:
         return edgar_pull.bridge_ciks()
@@ -318,7 +316,7 @@ def open_scores_log():
     Mirrors clean_filings.open_clean_log and edgar_pull.open_log: one flush per filing, so an
     interrupted scoring run keeps every row it produced and re-running resumes.
     """
-    CLEAN_DIR.mkdir(exist_ok=True)
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
     is_new = not SCORES_OUT.exists() or SCORES_OUT.stat().st_size == 0
     fh = SCORES_OUT.open("a", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
@@ -470,7 +468,7 @@ def write_diagnostics(scores: pd.DataFrame, dropped: pd.DataFrame) -> Path:
     At full-corpus scale the console cannot carry one line per dropped or flagged filing, so
     the identities live here and the console reports counts plus the first few.
     """
-    INTERMEDIATE_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
     keys = ["permno", "cik", "accession", "filing_date", "fiscal_year", "drop_reason"]
     diag = pd.concat([scores.assign(drop_reason=""), dropped.reindex(columns=keys)],
                      ignore_index=True)
@@ -481,7 +479,7 @@ def write_diagnostics(scores: pd.DataFrame, dropped: pd.DataFrame) -> Path:
 
 def write_term_hits(terms: list[str], diag: dict) -> Path:
     """Write the per-term hit table so zero-hit and runaway terms are auditable after the run."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame([{
         "term": t,
         "sentences_item1a": diag["term_1a"][t],

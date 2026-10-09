@@ -20,8 +20,8 @@ Run with a non-baseline cycle, the script additionally re-estimates the baseline
 stability test, CAR = a + b*TExp + B*cc + d*(TExp x cc) + ..., H0: d = 0, with standard errors
 clustered on permno.
 
-    python run_car_regression.py                    # 2025, the default
-    python run_car_regression.py --cycle cross_cycle
+    python src/run_car_regression.py                    # 2025, the default
+    python src/run_car_regression.py --cycle cross_cycle
 """
 
 from __future__ import annotations
@@ -37,16 +37,13 @@ from statsmodels.stats.stattools import jarque_bera
 
 import clean_controls_data as ccd
 import estimate_car as ec
+from config import BASE, CLEAN_DIR, EDGAR_LOG, INTERMEDIATE_DIR, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
-
 # Paths owned by earlier scripts are imported, not re-declared, so the panel location and the
-# event dates keep a single definition (the precedent Steps 4b and 4c set).
+# event dates keep a single definition.
 PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
 
 # TExp comes from the reference-date panel, never from tariff_scores.csv. Since Step 2 was rescaled
@@ -56,10 +53,9 @@ PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
 # (permno, reference_date); each event reads the slice at the reference date whose 10-K selection
 # window closed before it. That is what makes the cross-cycle events use their own filings.
 TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
-INTERMEDIATE_DIR = BASE / "intermediate"
 TEXP_PANEL_DIAG = INTERMEDIATE_DIR / "texp_panel_diagnostics.csv"  # per (permno, ref_date) drops
 FS_CSV = CLEAN_DIR / "foreign_sales_share.csv"
-EDGAR_LOG = BASE / "edgar_pull_log.csv"                 # supplies the pull-failure reasons
+# EDGAR_LOG supplies the pull-failure reasons.
 RESULTS_OUT = OUTPUT_DIR / "car_regression_results.csv"
 STABILITY_OUT = OUTPUT_DIR / "stability_test_results.csv"
 SIGNFLIP_OUT = OUTPUT_DIR / "signflip_test_results.csv"
@@ -308,7 +304,7 @@ def _reason_sources(diag: Path, log: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     run, nine more from build_fm_panel per vintage year - and each call used to re-read the whole
     5.5 MB pull log and the panel diagnostics from disk, then throw them away. That is eighteen
     full reads of the same two files per run for data keyed on a column both already carry, and it
-    is the round-trip CLAUDE.md's cleaned-data convention rules out.
+    is a redundant round-trip to disk for data the caller could already hold.
 
     Cached on the two paths, so a caller that legitimately points at different files still gets
     its own read. The frames are returned unsliced; the slicing stays in the caller.
@@ -820,7 +816,7 @@ def signflip_tests(fits: list, cycle: str) -> tuple[list[dict], list[dict]]:
 
 def write_signflip(rows: list[dict], path: Path | None = None) -> Path:
     """Every H1 sign-flip quantity, long format."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = SIGNFLIP_OUT if path is None else path
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -872,7 +868,7 @@ def industry_split(fits: list) -> list[dict]:
 def write_industry_split(rows: list[dict], path: Path | None = None) -> Path:
     """Within-FF12-group coefficients, long format. Its own file, so the headline results
     table keeps one row per (run, window, spec, term) and its schema does not shift."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = INDUSTRY_SPLIT_OUT if path is None else path
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -880,7 +876,7 @@ def write_industry_split(rows: list[dict], path: Path | None = None) -> Path:
 
 def write_stability(rows: list[dict], path: Path | None = None) -> Path:
     """Every stability-test quantity, long format."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = STABILITY_OUT if path is None else path
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -938,7 +934,7 @@ def signflip_matrix(fits: dict) -> None:
 
 def write_results(rows: list[dict], path: Path | None = None) -> Path:
     """Every coefficient from every specification, long format."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = RESULTS_OUT if path is None else path
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -1415,11 +1411,11 @@ def validate(active: dict, stability_summaries: list[dict], signflip_summaries: 
         _say("    controls to be pooled; the Wald test on the difference is valid either way, and")
         _say("    only this version leaves the reported b's reconcilable with section 7.2.")
         _say("  - PolRisk is NOT included, though section 7.6 nominates it and calls it a genuine")
-        _say("    strength of the out-of-sample leg. Descoped by instruction: the Hassan data is")
+        _say("    strength of the out-of-sample leg. Descoped: the Hassan data is")
         _say("    not in the project, and adding a control absent from the 2025 specification")
         _say("    would break the specification identity the out-of-sample claim rests on.")
         _say("  - The section 7.6 lexicon-stability check - 2018-vintage TExp against BEA/Census")
-        _say("    SIC import intensity - is NOT run. Descoped by instruction. Section 7.6 says it")
+        _say("    SIC import intensity - is NOT run. Descoped. Section 7.6 says it")
         _say("    governs interpretation of H4, so these results are reported without the")
         _say("    measurement gate the design places in front of them.")
     _say("  - Firms absent from the Compustat segment file are not imputed FS = 0. Absence is")
@@ -1434,7 +1430,7 @@ def validate(active: dict, stability_summaries: list[dict], signflip_summaries: 
         _say(f"  {path.relative_to(BASE)}")
     _say(f"  {REPORT_OUT.relative_to(BASE)}")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_OUT.write_text("\n".join(_REPORT), encoding="utf-8")
 
 

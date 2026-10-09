@@ -10,8 +10,8 @@ cumulates daily abnormal returns into CARs over [-1,+1], [-5,+5] and [-10,+10].
 Runs are estimated independently, with no betas reused across events or across the two 2025
 imposition windows. No cross-sectional regression on TExp - that is Script 3.
 
-    python estimate_car.py                    # 2025, the default
-    python estimate_car.py --cycle cross_cycle
+    python src/estimate_car.py                    # 2025, the default
+    python src/estimate_car.py --cycle cross_cycle
 """
 
 import argparse
@@ -21,20 +21,14 @@ import numpy as np
 import pandas as pd
 
 import clean_controls_data as ccd
+from config import BASE, INTERMEDIATE_DIR, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
-# Derived analytical panels and per-document diagnostics live here, not in output/.
-# output/ is for final results, validation reports and figures; these are inputs to a later
-# stage or per-row audit tables, and two of them are the largest files in the repo.
-INTERMEDIATE_DIR = BASE / "intermediate"
-
 # The panel path, the event dates and the cycle registry are owned by Script 1, which writes them;
-# importing rather than re-declaring keeps one definition (the precedent score_filings.py set for
-# clean_filings.py in Step 4b). These three are rebound by select_cycle().
+# importing rather than re-declaring keeps one definition. These three are rebound by
+# select_cycle().
 PANEL_PATH = ccd.PANEL_OUT.with_suffix(f".{ccd.OUTPUT_FORMAT}")
 FF_DAILY_FILES = ccd.CYCLES[ccd.DEFAULT_CYCLE]["ff_daily"]
 REPORT_OUT = OUTPUT_DIR / "car_estimation_validation_report.txt"
@@ -534,7 +528,7 @@ def run_event(panel: pd.DataFrame, excess: pd.DataFrame, fmat: np.ndarray,
 
 def write_car(frame: pd.DataFrame, path: Path) -> Path:
     """Write one run's per-firm CAR table."""
-    INTERMEDIATE_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False)
     return path
 
@@ -802,7 +796,7 @@ def validate(results: dict, cal: pd.DatetimeIndex, cal_stats: dict,
         _say(f"  {path.relative_to(BASE)}")
     _say(f"  {REPORT_OUT.relative_to(BASE)}")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_OUT.write_text("\n".join(_REPORT), encoding="utf-8")
 
 

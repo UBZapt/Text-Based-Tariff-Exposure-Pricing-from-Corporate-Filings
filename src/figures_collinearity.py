@@ -33,11 +33,9 @@ import chartstyle as cs
 import fama_macbeth_pricing as fmp
 import palette
 import run_car_regression as rcr
+from config import BASE, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- Configuration
-
-BASE = rcr.BASE
-OUTPUT_DIR = BASE / "output"
 
 CHART_EVENT_STUDY = OUTPUT_DIR / "fig_corr_event_study.png"
 CHART_FM_PANEL = OUTPUT_DIR / "fig_corr_fm_panel.png"

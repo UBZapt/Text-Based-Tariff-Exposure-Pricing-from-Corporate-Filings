@@ -13,7 +13,7 @@ the bridge is ever-qualifying across 2017-2026 while this list is point-in-time 
 and filtering the 2018-19 event pull through a 2025 screen would impose a survivorship filter
 the design does not ask for.
 
-    python persist_2025_universe.py
+    python src/persist_2025_universe.py
 """
 
 import argparse
@@ -23,12 +23,11 @@ import pandas as pd
 
 import edgar_pull as ep
 import estimate_car as ec
+from config import BASE, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
 
 # The imposition run carries the end-March-2025 screen. The reversal run's screen is evaluated
 # at 2025-07 and is deliberately not used here: section 7.0 names end-March 2025.
@@ -60,7 +59,7 @@ def _say(line: str = "") -> None:
 def write_report(path: Path | None = None) -> Path:
     """Persist the buffered run record."""
     path = REPORT_OUT if path is None else path
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(_REPORT), encoding="utf-8")
     return path
 
@@ -89,8 +88,7 @@ def load_screened_permnos(path: Path | None = None) -> list[int]:
 
     The path resolves at call time, not at definition. ``CAR_FILE`` derives from ``ec.RUNS``, which
     ``estimate_car.select_cycle`` rebinds, so a default argument would freeze whichever cycle was
-    active on import - the trap CLAUDE.md records and the one already closed in the three
-    event-study scripts.
+    active on import - the same trap already closed in the three event-study scripts.
     """
     car = ec.read_car(CAR_FILE if path is None else path)
     return sorted(int(p) for p in car.loc[car[SCREEN_COLUMN], "permno"])
@@ -117,7 +115,7 @@ def resolve_identifiers(permnos: list[int],
 
 def write_universe(frame: pd.DataFrame, path: Path = UNIVERSE_OUT) -> Path:
     """Write the universe list, zero-padded identifiers preserved as text."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False)
     return path
 

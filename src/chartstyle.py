@@ -228,7 +228,7 @@ def diverging_cmap() -> LinearSegmentedColormap:
 
 def save(fig, path: Path) -> Path:
     """Write at print resolution on the white ground and release the figure."""
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=DPI, facecolor=palette.SURFACE)
     plt.close(fig)
     return path

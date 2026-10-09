@@ -34,7 +34,7 @@ Assumptions, also stated in the validation report:
     difference is the estimation window. One rule serves all three windows, so that argument is
     untouched. The size and concentration diagnostics take REFERENCE_WINDOW's weights.
 
-    python decile_sort.py
+    python src/decile_sort.py
 """
 
 from pathlib import Path
@@ -51,13 +51,11 @@ import palette
 import clean_data as cd
 import clean_controls_data as ccd
 import estimate_car as ec
+from config import BASE, CLEAN_DIR, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
 
 # The panel path, event dates, runs, windows and CAR reader are owned by Scripts 1 and 2;
 # importing rather than re-declaring keeps one definition, as run_car_regression.py does.
@@ -134,7 +132,6 @@ N_POSITIVE_GROUPS = 9            # groups 1..9 over the strictly positive remain
 GROUPS = [ZERO_GROUP] + list(range(1, N_POSITIVE_GROUPS + 1))
 
 PANEL_COLUMNS = ["permno", "date", WEIGHT_COLUMN]
-MAX_LISTED = 10                  # identities printed before deferring to a count
 RULE = "=" * 78
 THIN = "-" * 78
 
@@ -187,12 +184,6 @@ def _section(title: str) -> None:
     _say()
     _say(title)
     _say(THIN)
-
-
-def _listed(values) -> str:
-    vals = list(values)
-    head = ", ".join(str(v) for v in vals[:MAX_LISTED])
-    return head if len(vals) <= MAX_LISTED else f"{head}, ... (+{len(vals) - MAX_LISTED} more)"
 
 
 def _short(window: str) -> str:
@@ -451,7 +442,7 @@ def group_car(cars: dict[str, pd.DataFrame], groups: pd.Series, universe: pd.Dat
 
 
 def write_results(results: pd.DataFrame, path: Path = RESULTS_OUT) -> Path:
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     results.to_csv(path, index=False)
     return path
 

@@ -12,10 +12,10 @@ The segment file carries no company-total row (geotp is only 2/3 plus non-geogra
 rows), so the denominator is built from every row in the firm-datadate group and the
 domestic + foreign vs total reconciliation is reported per firm-year as recon_gap.
 
-Reads the 2025-04-02 cross-section of clean_data/texp_panel.csv; the scoring pipeline itself is
+Reads the 2025-04-02 cross-section of data/clean/texp_panel.csv; the scoring pipeline itself is
 not touched.
 
-    python foreign_sales.py
+    python src/foreign_sales.py
 """
 
 import argparse
@@ -30,14 +30,12 @@ from scipy import stats
 
 import chartstyle as cs
 import palette
+from config import BASE, CLEAN_DIR, OUTPUT_DIR, RAW_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
-SEGMENT_FILE = BASE / "Compustat Geographic segment data.csv"
+SEGMENT_FILE = RAW_DIR / "Compustat Geographic segment data.csv"
 BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
 FS_OUT = CLEAN_DIR / "foreign_sales_share.csv"
 
@@ -51,7 +49,7 @@ FS_OUT = CLEAN_DIR / "foreign_sales_share.csv"
 # and lists the alternatives if the panel ever stops carrying it.
 TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
 TEXP_REFERENCE_DATE = "2025-04-02"
-# CSV rather than Parquet throughout: Smart App Control blocks pyarrow's DLLs (build_notes 4b).
+# CSV rather than Parquet throughout: Windows Smart App Control blocks pyarrow's DLLs.
 # cik and accession must come back as strings or their zero padding is lost, exactly as gvkey
 # would be - the failure this module already documents for the unpadded segment export.
 TEXP_READ_DTYPES = {"cik": str, "accession": str}
@@ -512,7 +510,7 @@ def write_report(seg: pd.DataFrame, kept: pd.DataFrame, lost: pd.DataFrame,
     for path in (FS_OUT, SCATTER_OUT, REPORT_OUT):
         _say(f"  {path.relative_to(BASE)}")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_OUT.write_text("\n".join(_REPORT) + "\n", encoding="utf-8")
 
 
@@ -563,7 +561,7 @@ def main(argv: list[str] | None = None) -> pd.DataFrame | None:
     scores = load_texp_vintage()
     merged = merge_texp(linked, scores)
 
-    CLEAN_DIR.mkdir(exist_ok=True)
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
     linked.reindex(columns=OUTPUT_COLUMNS).to_csv(FS_OUT, index=False)
 
     corr = correlations(merged)

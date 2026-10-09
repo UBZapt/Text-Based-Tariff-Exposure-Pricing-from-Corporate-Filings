@@ -9,15 +9,14 @@ The source CSVs are NOT removed. They stay because they are the machine-readable
 diffing them is how every numerical change in this project is verified, and because one of them -
 car_regression_results.csv - is a genuine input to fama_macbeth_pricing.py.
 
-Deliberately excluded, per the brief's "excludes cleaned data, and any intermediate data panel not
-itself reported on":
-  - intermediate/controls_panel*.csv  1.1M and 2.2M rows, past Excel's 1,048,576-row limit anyway
-  - intermediate/car_*.csv            per-firm CARs; the regressions' input, not a reported table
-  - intermediate/*_diagnostics.csv    per-document and per-firm-date audit tables
-  - clean_data/*                      cleaned source data
-  - output/*.txt, output/*.png        validation reports and figures keep their own formats
+Deliberately excluded, as cleaned data and intermediate panels are not themselves reported:
+  - data/intermediate/controls_panel*.csv  1.1M and 2.2M rows, past Excel's 1,048,576-row limit
+  - data/intermediate/car_*.csv            per-firm CARs; the regressions' input, not a reported table
+  - data/intermediate/*_diagnostics.csv    per-document and per-firm-date audit tables
+  - data/clean/*                           cleaned source data
+  - output/*.txt, output/*.png             validation reports and figures keep their own formats
 
-    python build_results_workbook.py
+    python src/build_results_workbook.py
 """
 
 import argparse
@@ -25,18 +24,18 @@ from pathlib import Path
 
 import pandas as pd
 
+from config import BASE, OUTPUT_DIR
+
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
 WORKBOOK_OUT = OUTPUT_DIR / "results_workbook.xlsx"
 
 # Excel caps sheet names at 31 characters and forbids : \ / ? * [ ]. Names are chosen short
 # enough to survive that without truncation, and ordered as the dissertation reports them.
 #
 # `read_kwargs` carries per-file reader options. full_panel_firm_sample.csv leads with a `#`
-# provenance header, so it needs comment="#" - the same contract CLAUDE.md records for it.
+# provenance header, so it needs comment="#".
 SHEETS = [
     {"sheet": "7.2 CAR regressions", "file": "car_regression_results.csv",
      "section": "7.2", "about": "Cross-sectional CAR regressions, 2025 cycle (H1, H5)"},
@@ -106,7 +105,7 @@ def write_workbook(frames: dict[str, pd.DataFrame], contents: list[dict],
                    path: Path | None = None) -> Path:
     """One sheet per table, contents first so the workbook opens on an index."""
     path = WORKBOOK_OUT if path is None else path
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     index = pd.DataFrame(contents)[["Sheet", "Design section", "Contents", "Rows", "Status",
                                     "Source file"]]
     with pd.ExcelWriter(path, engine=ENGINE) as writer:

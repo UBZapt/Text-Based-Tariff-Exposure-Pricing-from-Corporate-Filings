@@ -10,8 +10,8 @@ Every candidate firm-month is written, kept or not, carrying the reason it was e
 is therefore self-describing: Script 7b derives the funnel, the per-vintage table and the monthly
 cross-section counts from it without a second source.
 
-    python build_fm_panel.py
-    python build_fm_panel.py --status     # funnel and monthly counts, writes nothing
+    python src/build_fm_panel.py
+    python src/build_fm_panel.py --status     # funnel and monthly counts, writes nothing
 """
 
 from __future__ import annotations
@@ -27,13 +27,11 @@ import run_report
 import clean_controls_data as ccd
 import clean_data as cd
 import run_car_regression as rcr
+from config import BASE, CLEAN_DIR, INTERMEDIATE_DIR, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
 REPORT_OUT = OUTPUT_DIR / "fm_panel_validation_report.txt"
 
 MONTHLY_RAW_FILE = ccd.MONTHLY_RAW_FILE      # unscreened CRSP monthly: return, cap, SIC
@@ -42,7 +40,6 @@ BRIDGE_CSV = ccd.BRIDGE_CSV
 SUBSAMPLE_CSV = OUTPUT_DIR / "full_panel_firm_sample.csv"
 TEXP_PANEL_CSV = CLEAN_DIR / "texp_panel.csv"
 EPU_CSV = CLEAN_DIR / "clean_epu.csv"
-INTERMEDIATE_DIR = BASE / "intermediate"   # derived analytical panel, as controls_panel is
 PANEL_OUT = INTERMEDIATE_DIR / "fm_panel.csv"
 
 # Sample window. The left edge is set by the momentum control, not by choice: Monthly Returns.csv
@@ -52,7 +49,7 @@ PANEL_OUT = INTERMEDIATE_DIR / "fm_panel.csv"
 SAMPLE_START = pd.Period("2018-01", freq="M")
 SAMPLE_END = pd.Period("2025-12", freq="M")
 
-# The full_panel batch: April 2 each year 2017-2025, pulled at scope subsample (CLAUDE.md). The
+# The full_panel batch: April 2 each year 2017-2025, pulled at scope subsample (edgar_pull.BATCHES). The
 # other eight reference dates in texp_panel.csv belong to the cross-cycle event study and are not
 # this test's vintages.
 VINTAGE_SUFFIX = "-04-02"
@@ -581,7 +578,7 @@ def main() -> pd.DataFrame | None:
     if args.status:
         return None
 
-    INTERMEDIATE_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
     panel.to_csv(PANEL_OUT, index=False)
     print(f"\nWrote {PANEL_OUT.relative_to(BASE)} "
           f"({len(panel):,} rows x {len(panel.columns)} cols).")

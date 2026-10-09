@@ -29,11 +29,9 @@ from matplotlib.patches import Patch
 import chartstyle as cs
 import fama_macbeth_pricing as fmp
 import palette
+from config import BASE, OUTPUT_DIR
 
 # --------------------------------------------------------------------------- Configuration
-
-BASE = fmp.BASE
-OUTPUT_DIR = BASE / "output"
 
 LAMBDA_CSV = OUTPUT_DIR / "fm_lambda_panel.csv"
 REGIME_CSV = OUTPUT_DIR / "fm_epu_regime_results.csv"

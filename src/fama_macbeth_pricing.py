@@ -20,7 +20,7 @@ lambda_1_bar is the specification and not the sample.
 PolRisk is excluded, per the constraint note at the head of section 7: the Hassan series ends
 March 2021 and including it would truncate the panel past the events the dissertation is built on.
 
-    python fama_macbeth_pricing.py
+    python src/fama_macbeth_pricing.py
 """
 
 from __future__ import annotations
@@ -42,13 +42,11 @@ import palette
 import build_fm_panel as bfp                                       # noqa: E402
 import clean_controls_data as ccd                                  # noqa: E402
 import run_car_regression as rcr                                   # noqa: E402
+from config import BASE, OUTPUT_DIR                                # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
-
 PANEL_CSV = bfp.PANEL_OUT
 TEXP_PANEL_CSV = bfp.TEXP_PANEL_CSV
 CAR_RESULTS_CSV = OUTPUT_DIR / "car_regression_results.csv"       # section 7.2, for the comparison
@@ -118,7 +116,7 @@ LAMBDA_COLUMNS = ["ym", "spec", "lambda_texp", "se", "t", "p", "stars", "lambda_
                   "n_firms", "r2", "adj_r2", "epu_lag", "episode"]
 
 # --- section 7.5: EPU regime conditioning (H3) ------------------------------ #
-# tau is the percentile of the EPU series over 2017-2026, per section 7.5 and the brief - not over
+# tau is the percentile of the EPU series over 2017-2026, per section 7.5 - not over
 # the 96 estimated months. The series ends 2026-05, so the realised window is 113 months and
 # includes 17 that sit outside the Fama-MacBeth sample; the sample-window alternative is reported
 # as a contrast and not used. Fixed here, before estimation, and never searched over.
@@ -548,7 +546,7 @@ def regime_table(primary: pd.DataFrame, taus: dict[int, float]) -> pd.DataFrame:
 
 def write_regime_results(table: pd.DataFrame, path: Path = REGIME_OUT) -> Path:
     """The machine-readable form of the section 10 and 11 tables."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False)
     return path
 
@@ -580,7 +578,7 @@ def headline_results(lambdas: pd.DataFrame, params: pd.DataFrame) -> pd.DataFram
 
 def write_headline_results(table: pd.DataFrame, path: Path = HEADLINE_OUT) -> Path:
     """The H2 headline, which previously reached no output file at all."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False)
     return path
 
@@ -1145,8 +1143,8 @@ def write_report(panel: pd.DataFrame, sample: pd.DataFrame, lambdas: pd.DataFram
     _say("     v6 drops it with the long-short portfolio it depended on.")
     _say("  Section 7.5 (sections 10-12) adds:")
     _say(f"  8. tau is a percentile of the EPU series over {tau_stats['span'][0]} .. "
-         f"{tau_stats['span'][1]}, per section 7.5 and")
-    _say("     the brief, not of the EPU values the estimated months carry. The window therefore")
+         f"{tau_stats['span'][1]}, per section 7.5,")
+    _say("     not of the EPU values the estimated months carry. The window therefore")
     _say(f"     includes {tau_stats['n_months'] - len(primary)} months outside the "
          f"Fama-MacBeth sample. The sample-window alternative")
     _say("     is reported in section 10 as a contrast and is not used.")
@@ -1211,7 +1209,7 @@ def main() -> pd.DataFrame:
     if len(primary) != expected:
         raise ValueError(f"estimated {len(primary)} monthly cross-sections, expected {expected}")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     lambdas.assign(ym=lambdas["ym"].astype(str)).to_csv(LAMBDA_OUT, index=False)
     chart = plot_lambda(primary, episodes)
 

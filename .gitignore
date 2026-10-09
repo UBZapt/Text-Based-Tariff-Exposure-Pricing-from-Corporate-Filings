@@ -21,20 +21,15 @@
 *.txt
 !requirements.txt
 
-# Pipeline outputs derived from licensed data (redundant with *.csv/*.parquet, kept explicit)
-clean_data/
-intermediate/
-clean_firm_bridge.csv
-edgar_pull_log.csv
+# Raw inputs, cached SEC filings and every derived panel live under data/
+data/
 
-# --- Cached SEC filings (bulk raw HTML) ---
-filings_raw/
-
-# --- Internal methodology & project instructions (not for publication) ---
-CLAUDE.md
-Tariff_Factor_Research_Design_v*.md
-Research_Design_v6_revised_sections.md
-build_notes.md
+# --- Local notes, documents and assistant instruction files (README.md is the only markdown) ---
+*.md
+!README.md
+*.pdf
+*.doc
+*.docx
 
 # --- Credentials & secrets: use environment variables / a local .env instead ---
 .env
@@ -59,13 +54,13 @@ wrds_credentials.*
 id_rsa
 *.ppk
 
-# --- Claude Code local settings ---
-# The whole directory, not just settings.local.json: permission allowlists accumulate literal
-# command lines, which have already captured a personal email address once, and anything else
-# added to this directory would otherwise be tracked by default.
+# --- Local IDE and assistant settings ---
 .claude/
+.cursor/
+.cursorrules
+.vscode/
 
-# --- CLAUDE.md-mandated minimums ---
+# --- Generated results ---
 output/
 logs/*.tmp
 logs/
@@ -296,5 +291,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-submissions_cache/
-clean_text/
