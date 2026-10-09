@@ -12,27 +12,22 @@ the document and deliberately has no reference_date column, because the same 10-
 recent filing at several dates and carries the same raw score at each. Pooling the
 standardisation across 17 dates would mix vintages into one distribution.
 
-    python build_texp_panel.py
-    python build_texp_panel.py --status     # per-date counts, writes nothing
+    python src/build_texp_panel.py
+    python src/build_texp_panel.py --status     # per-date counts, writes nothing
 """
 
 import argparse
-from pathlib import Path
 
 import pandas as pd
 
 import run_report
 
 import score_filings
+from config import BASE, CLEAN_DIR, EDGAR_LOG as LOG_CSV, INTERMEDIATE_DIR, OUTPUT_DIR
 
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
 REPORT_OUT = OUTPUT_DIR / "texp_panel_validation_report.txt"
-LOG_CSV = BASE / "edgar_pull_log.csv"
 SCORES_CSV = CLEAN_DIR / "tariff_scores.csv"
 PANEL_OUT = CLEAN_DIR / "texp_panel.csv"
-INTERMEDIATE_DIR = BASE / "intermediate"   # per firm-date drop table, read by later stages
 DIAG_OUT = INTERMEDIATE_DIR / "texp_panel_diagnostics.csv"
 
 # Maximum age of the fiscal period behind a filing, measured to the reference date in exact
@@ -188,8 +183,8 @@ def main() -> pd.DataFrame | None:
     if args.status:
         return None
 
-    CLEAN_DIR.mkdir(exist_ok=True)
-    INTERMEDIATE_DIR.mkdir(exist_ok=True)
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
     panel.to_csv(PANEL_OUT, index=False)
     print(f"\nWrote {PANEL_OUT.relative_to(BASE)} "
           f"({len(panel):,} rows x {len(panel.columns)} cols).")

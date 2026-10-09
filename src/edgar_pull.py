@@ -27,13 +27,13 @@ command carries on from where it stopped. Cached filings whose firm has left the
 universe are pruned. No text parsing, tokenization, or scoring is performed here
 (that is Step 2).
 
-    python edgar_pull.py --all                  # full universe (hours; run in background)
-    python edgar_pull.py --status               # coverage report; no network calls
-    python edgar_pull.py --status --batch cross_cycle      # per-date coverage matrix
-    python edgar_pull.py --batch cross_cycle               # download-bound; run in background
-    python edgar_pull.py --batch full_panel                # run cross_cycle first: it caches
+    python src/edgar_pull.py --all                  # full universe (hours; run in background)
+    python src/edgar_pull.py --status               # coverage report; no network calls
+    python src/edgar_pull.py --status --batch cross_cycle      # per-date coverage matrix
+    python src/edgar_pull.py --batch cross_cycle               # download-bound; run in background
+    python src/edgar_pull.py --batch full_panel                # run cross_cycle first: it caches
                                                           # nearly all the 1,001 CIKs it needs
-    python edgar_pull.py [--n-ciks 50] [--reference-date 2025-04-02] [--scope full] [--retry-all]
+    python src/edgar_pull.py [--n-ciks 50] [--reference-date 2025-04-02] [--scope full] [--retry-all]
 
 IMPORTANT: set a real name/email via the EDGAR_USER_AGENT environment variable (or a
 gitignored .env file) before any run - the SEC fair-access policy requires a genuine
@@ -53,6 +53,9 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+
+from config import (BASE, CLEAN_DIR, EDGAR_LOG as LOG_CSV, ENV_FILE, FILINGS_DIR, OUTPUT_DIR,
+                    SUBMISSIONS_DIR)
 
 
 def _load_dotenv(path: Path) -> None:
@@ -74,23 +77,17 @@ def _load_dotenv(path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
 BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
-FILINGS_DIR = BASE / "filings_raw"
-# Gzipped submissions JSON, one file per CIK. The submissions history is identical for
-# every reference date, so one fetch serves a whole multi-date batch (see get_submissions).
-SUBMISSIONS_DIR = BASE / "submissions_cache"
-# The pull log is resumable pull state paired with FILINGS_DIR, not an analysis output, so it
-# stays beside the cache: if it cannot be found, every CIK reads as incomplete and re-pulls.
-LOG_CSV = BASE / "edgar_pull_log.csv"
+# SUBMISSIONS_DIR holds gzipped submissions JSON, one file per CIK. The submissions history is
+# identical for every reference date, so one fetch serves a whole multi-date batch (see
+# get_submissions). LOG_CSV is resumable pull state paired with FILINGS_DIR, not an analysis
+# output: if it cannot be found, every CIK reads as incomplete and re-pulls.
 
 # SEC fair access requires a descriptive User-Agent "AppName ContactEmail".
 # Supply a real, monitored contact via the EDGAR_USER_AGENT environment variable
 # (set it in your shell or a gitignored .env file); never hard-code it. The
 # default below is a non-functional placeholder that triggers a warning.
-_load_dotenv(BASE / ".env")
+_load_dotenv(ENV_FILE)
 _PLACEHOLDER_UA = "TariffFactorResearch your-email@example.com"
 USER_AGENT = os.environ.get("EDGAR_USER_AGENT", _PLACEHOLDER_UA)
 USER_AGENT_IS_PLACEHOLDER = USER_AGENT == _PLACEHOLDER_UA
@@ -143,9 +140,10 @@ SCOPES = {"full": None, "subsample": SAMPLE_CSV}
 # December-FY firm gets its FY(y-1) 10-K filed in Feb/Mar of year y.
 FULL_PANEL_DATES = [f"{year}-04-02" for year in range(2017, 2026)]
 
-# Cross-cycle event pull, section 7.6. Seven Section 301 escalations from Bruno, Goltz & Luyten
-# (2024) Table 3, used exactly as published so the event-date selection carries no discretion,
-# plus the two reversal dates: 2019-10-11 (primary) and 2020-01-15 (Phase One, robustness).
+# Cross-cycle event pull, section 7.6. Seven trade-war escalations from Bruno, Goltz & Luyten
+# (2024) Table 3 (sourced from Amiti, Kong & Weinstein 2020), used exactly as published so the
+# event-date selection carries no discretion, plus the two reversal dates: 2019-10-11 (primary)
+# and 2020-01-15 (Phase One, robustness).
 CROSS_CYCLE_DATES = ["2018-03-01", "2018-03-22", "2018-04-02", "2018-06-15", "2018-09-17",
                      "2019-05-10", "2019-08-23", "2019-10-11", "2020-01-15"]
 
@@ -295,7 +293,7 @@ def bridge_ciks(bridge_csv: Path = BRIDGE_CSV) -> set[str]:
     interval covers the reference date, so the resolved CIK set shifts with the date (4,230 at
     2025-04-02, 4,190 at 2019-10-11). Pruning against a date-resolved set therefore deletes
     filings pulled at a different date - harmless while 2025-04-02 was the only date in use,
-    but destructive as soon as the cache spans several. filings_raw/ spans every reference
+    but destructive as soon as the cache spans several. data/filings/raw/ spans every reference
     date, so retention has to as well.
     """
     cik = pd.read_csv(bridge_csv, dtype=str, usecols=["cik"])["cik"].fillna("")
@@ -386,7 +384,7 @@ def get_submissions(cik: str, ref: pd.Timestamp) -> dict:
         path.unlink(missing_ok=True)      # truncated, corrupt or written by an older format
 
     subs = _get(SUBMISSIONS_URL.format(cik=cik)).json()
-    SUBMISSIONS_DIR.mkdir(exist_ok=True)
+    SUBMISSIONS_DIR.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".part")
     with gzip.open(tmp, "wt", encoding="utf-8") as fh:
         json.dump({"fetched_at": pd.Timestamp.now().isoformat(), "submissions": subs}, fh)
@@ -578,7 +576,7 @@ def open_log():
 def prune_stale(log: pd.DataFrame, universe_ciks: set[str]) -> list[str]:
     """Delete cached filings whose CIK has left the firm universe.
 
-    filings_raw/ is a cache of the current universe; the log is the permanent
+    data/filings/raw/ is a cache of the current universe; the log is the permanent
     pull history, so its rows are left in place and only the files are removed.
     """
     if log.empty:
@@ -721,7 +719,7 @@ def pull_gap(n_ciks: int | None, ref: pd.Timestamp,
     pruned and .part files from an interrupted run are cleared first. The log is written
     row-by-row, so an interruption at any point leaves a resumable state.
     """
-    FILINGS_DIR.mkdir(exist_ok=True)
+    FILINGS_DIR.mkdir(parents=True, exist_ok=True)
     _prevent_sleep()
     if USER_AGENT_IS_PLACEHOLDER:
         print("!! WARNING: USER_AGENT is a placeholder — set a real name/email "
@@ -732,7 +730,7 @@ def pull_gap(n_ciks: int | None, ref: pd.Timestamp,
     firms = scope_firms(scope, bridge_firms)
     # Retention is decided against the whole bridge and independently of this reference date -
     # never the active scope, and never the date-resolved universe (see bridge_ciks).
-    # filings_raw/ is a cache of the bridge across every reference date; pruning against a
+    # data/filings/raw/ is a cache of the bridge across every reference date; pruning against a
     # narrower or date-specific set would delete filings the full-universe scoring and the
     # section 8 unscreened cross-section depend on.
     retain_ciks = bridge_ciks()
@@ -830,7 +828,7 @@ def restore_missing(dry_run: bool = False) -> pd.DataFrame:
         print("\n--dry-run: nothing fetched. Re-run without it to restore.")
         return log
 
-    FILINGS_DIR.mkdir(exist_ok=True)
+    FILINGS_DIR.mkdir(parents=True, exist_ok=True)
     _prevent_sleep()
     clear_partials()
     fh, writer = open_log()
@@ -1029,7 +1027,7 @@ def print_assumptions(n_ciks: int | None, ref: pd.Timestamp, scope: str = "full"
          f"process, each an ordinary gap-only pull." if batch else
          f"Single reference date {ref.date()}."),
         ("Cache retention (prune_stale) is decided against the BRIDGE, never the active scope. "
-         "filings_raw/ is a cache of the bridge; pruning against a narrower scope would delete "
+         "data/filings/raw/ is a cache of the bridge; pruning against a narrower scope would delete "
          "filings the full-universe scoring and the section 8 unscreened cross-section need."),
         ("Scope = the whole list." if n_ciks is None else
          f"Work list capped at the first {n_ciks:,} distinct CIKs in ascending PERMNO order "

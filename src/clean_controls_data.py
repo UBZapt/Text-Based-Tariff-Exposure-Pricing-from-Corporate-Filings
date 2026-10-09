@@ -14,8 +14,8 @@ Cleaning only. No abnormal returns, no market model, no regression - those are S
 Fundamentals are gated point-in-time on the date they actually became public: the real 10-K
 filing date from edgar_pull_log.csv where known, otherwise datadate + FUNDAMENTAL_LAG_DAYS.
 
-    python clean_controls_data.py                    # 2025, the default
-    python clean_controls_data.py --cycle cross_cycle
+    python src/clean_controls_data.py                    # 2025, the default
+    python src/clean_controls_data.py --cycle cross_cycle
 """
 
 import argparse
@@ -25,23 +25,16 @@ import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
+from config import CLEAN_DIR, EDGAR_LOG, INTERMEDIATE_DIR, OUTPUT_DIR, RAW_DIR
+
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-CLEAN_DIR = BASE / "clean_data"
-OUTPUT_DIR = BASE / "output"
-# Derived analytical panels and per-document diagnostics live here, not in output/.
-# output/ is for final results, validation reports and figures; these are inputs to a later
-# stage or per-row audit tables, and two of them are the largest files in the repo.
-INTERMEDIATE_DIR = BASE / "intermediate"
-
-MONTHLY_RAW_FILE = BASE / "Monthly Returns.csv"   # unscreened history, for the momentum control
-FUNDA_FILE = BASE / "BM and Lev.csv"
-SICCODES_FILE = BASE / "Siccodes12.txt"
+MONTHLY_RAW_FILE = RAW_DIR / "Monthly Returns.csv"   # unscreened history, for the momentum control
+FUNDA_FILE = RAW_DIR / "BM and Lev.csv"
+SICCODES_FILE = RAW_DIR / "Siccodes12.txt"
 BRIDGE_CSV = CLEAN_DIR / "clean_firm_bridge.csv"
 MONTHLY_CSV = CLEAN_DIR / "clean_returns.csv"
-EDGAR_LOG = BASE / "edgar_pull_log.csv"
 
 # --------------------------------------------------------------------------- #
 # Cycles                                                                      #
@@ -70,7 +63,8 @@ EDGAR_LOG = BASE / "edgar_pull_log.csv"
 #                  by construction.
 #   suffix         appended to every output filename.
 CROSS_CYCLE_EVENTS = {
-    # Section 301 escalations, Bruno, Goltz & Luyten (2024) Table 3, used exactly as published.
+    # Trade-war escalations (US tariffs and Chinese retaliation), Bruno, Goltz & Luyten (2024)
+    # Table 3, used exactly as published; they take the dates from Amiti, Kong & Weinstein (2020).
     "escalate_20180301": "2018-03-01",
     "escalate_20180322": "2018-03-22",
     "escalate_20180402": "2018-04-02",
@@ -85,8 +79,8 @@ CROSS_CYCLE_EVENTS = {
 
 CYCLES = {
     "2025": {
-        "daily_files": [BASE / "Daily returns.csv"],
-        "ff_daily": [BASE / "Fama French daily.csv"],
+        "daily_files": [RAW_DIR / "Daily returns.csv"],
+        "ff_daily": [RAW_DIR / "Fama French daily.csv"],
         "events": {"impose": "2025-04-02", "reverse": "2025-08-29"},
         "texp_ref": {"impose": "2025-04-02", "reverse": "2025-04-02"},
         "expected_sign": {"impose": -1, "reverse": +1},
@@ -98,10 +92,10 @@ CYCLES = {
         # Two exports: the original 2018-2020 pull plus the 2017 extension that the 252-day
         # estimation window at 2018-03-01 requires. Their 61-day overlap is byte-identical
         # (174,902 rows, no value differences), and dedupe_daily raises if that ever stops holding.
-        "daily_files": [BASE / "CRSP Daily returns cross cycle.csv",
-                        BASE / "CRSp Daily returns cross cycle pt2.csv"],
-        "ff_daily": [BASE / "FF5+MOM daily Cross cycle.csv",
-                     BASE / "FF5 + MOM daily cross cycle pt2.csv"],
+        "daily_files": [RAW_DIR / "CRSP Daily returns cross cycle.csv",
+                        RAW_DIR / "CRSp Daily returns cross cycle pt2.csv"],
+        "ff_daily": [RAW_DIR / "FF5+MOM daily Cross cycle.csv",
+                     RAW_DIR / "FF5 + MOM daily cross cycle pt2.csv"],
         "events": CROSS_CYCLE_EVENTS,
         "texp_ref": {k: v for k, v in CROSS_CYCLE_EVENTS.items()},
         "expected_sign": {k: (+1 if k.startswith("de_escalate") else -1)
@@ -774,7 +768,7 @@ def restrict_universe(daily: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
 # --------------------------------------------------------------------------- #
 def write_panel(daily: pd.DataFrame) -> Path:
     """Write the panel in the configured format."""
-    INTERMEDIATE_DIR.mkdir(exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
     out = daily.reindex(columns=output_columns())
     path = PANEL_OUT.with_suffix(f".{OUTPUT_FORMAT}")
     if OUTPUT_FORMAT == "parquet":
@@ -1029,7 +1023,7 @@ def validate(panel: pd.DataFrame, fund: pd.DataFrame, bridge: pd.DataFrame,
                  f"ceq={_num(r['ceq'], ',.0f')}m  bm={_num(r['bm'], '.4f')}  "
                  f"lev={_num(r['lev'], '.4f')}")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_OUT.write_text("\n".join(_REPORT), encoding="utf-8")
 
 

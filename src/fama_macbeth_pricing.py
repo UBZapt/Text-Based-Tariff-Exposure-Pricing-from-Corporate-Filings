@@ -20,7 +20,7 @@ lambda_1_bar is the specification and not the sample.
 PolRisk is excluded, per the constraint note at the head of section 7: the Hassan series ends
 March 2021 and including it would truncate the panel past the events the dissertation is built on.
 
-    python fama_macbeth_pricing.py
+    python src/fama_macbeth_pricing.py
 """
 
 from __future__ import annotations
@@ -37,17 +37,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt                                    # noqa: E402
 from matplotlib.dates import DateFormatter, YearLocator            # noqa: E402
 
+import chartstyle as cs                                            # noqa: E402
 import palette
 import build_fm_panel as bfp                                       # noqa: E402
 import clean_controls_data as ccd                                  # noqa: E402
 import run_car_regression as rcr                                   # noqa: E402
+from config import BASE, OUTPUT_DIR                                # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
-BASE = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE / "output"
-
 PANEL_CSV = bfp.PANEL_OUT
 TEXP_PANEL_CSV = bfp.TEXP_PANEL_CSV
 CAR_RESULTS_CSV = OUTPUT_DIR / "car_regression_results.csv"       # section 7.2, for the comparison
@@ -117,7 +116,7 @@ LAMBDA_COLUMNS = ["ym", "spec", "lambda_texp", "se", "t", "p", "stars", "lambda_
                   "n_firms", "r2", "adj_r2", "epu_lag", "episode"]
 
 # --- section 7.5: EPU regime conditioning (H3) ------------------------------ #
-# tau is the percentile of the EPU series over 2017-2026, per section 7.5 and the brief - not over
+# tau is the percentile of the EPU series over 2017-2026, per section 7.5 - not over
 # the 96 estimated months. The series ends 2026-05, so the realised window is 113 months and
 # includes 17 that sit outside the Fama-MacBeth sample; the sample-window alternative is reported
 # as a contrast and not used. Fixed here, before estimation, and never searched over.
@@ -144,14 +143,14 @@ REGIME_COLUMNS = ["split", "tau_pct", "tau", "regime", "n_months", "series_conti
                   "hac_diff_se", "hac_diff_t", "hac_diff_p", "hac_diff_stars"]
 OUTSIDE_LABEL = "outside both episodes"
 
-# Chart. Two hues of the project's validated palette (decile_sort.PALETTE, dataviz reference
-# instance); this chart plots one series, so only slot 1 and the neutrals are used and there is no
-# legend - the title names the series. Validated on the light surface: #2a78d6 passes the
-# lightness band, chroma floor and 3:1 contrast against #fcfcfb.
+# Chart. One data series, so only slot 1 and the neutrals are used and there is no legend - the
+# title names the series. Axis furniture comes from chartstyle.
 PALETTE = palette.roles(series="CATEGORICAL_1")
-EPISODE_ALPHA = 0.55
+EPISODE_ALPHA = 0.8
+EPISODE_TICK = 0.028              # floor-tick height, in axes fraction
 N_LABELLED_EXTREMES = 2           # direct labels are selective by design; never one per point
-Y_PAD_LOW, Y_PAD_HIGH = 0.16, 0.20   # headroom the extreme and episode labels sit in
+MAX_YTICKS = 6                    # rotated labels stack, so a dense scale runs together
+Y_PAD_LOW, Y_PAD_HIGH = 0.24, 0.24   # headroom the extreme and episode labels sit in
 
 RULE = "=" * 78
 
@@ -547,7 +546,7 @@ def regime_table(primary: pd.DataFrame, taus: dict[int, float]) -> pd.DataFrame:
 
 def write_regime_results(table: pd.DataFrame, path: Path = REGIME_OUT) -> Path:
     """The machine-readable form of the section 10 and 11 tables."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False)
     return path
 
@@ -579,7 +578,7 @@ def headline_results(lambdas: pd.DataFrame, params: pd.DataFrame) -> pd.DataFram
 
 def write_headline_results(table: pd.DataFrame, path: Path = HEADLINE_OUT) -> Path:
     """The H2 headline, which previously reached no output file at all."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False)
     return path
 
@@ -587,25 +586,22 @@ def write_headline_results(table: pd.DataFrame, path: Path = HEADLINE_OUT) -> Pa
 # --------------------------------------------------------------------------- #
 # Chart                                                                       #
 # --------------------------------------------------------------------------- #
-def plot_lambda(lambdas: pd.DataFrame, episodes: list[dict], test: dict,
+def plot_lambda(lambdas: pd.DataFrame, episodes: list[dict],
                 path: Path = CHART_OUT) -> Path:
     """The section 7.4 figure: the monthly exposure premium, with the policy episodes marked.
 
-    One series, so no legend - the title names it. Coefficients are drawn in percentage points a
-    month per standard deviation of exposure, which is the unit the text quotes; the panel's own
-    CSV keeps them in native decimals. Direct labels go on the extremes only: a value beside every
-    one of ninety-six points is unreadable and goes unread.
+    Coefficients are drawn in percentage points a month per standard deviation of exposure, which
+    is the unit the text quotes; the panel's own CSV keeps them in native decimals. Direct labels
+    go on the extremes only: a value beside every one of ninety-six points is unreadable and goes
+    unread. The mean and its Newey-West test are reported in fm_headline_results.csv and in the
+    caption, not inside the frame.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    plt.rcParams["font.family"] = "serif"
-
     frame = lambdas.sort_values("ym")
     x = pd.PeriodIndex(frame["ym"]).to_timestamp(how="end")
     y = frame["lambda_texp"].to_numpy() * 100
 
-    fig, ax = plt.subplots(figsize=(10, 4.8), dpi=300)
-    fig.patch.set_facecolor(PALETTE["surface"])
-    ax.set_facecolor(PALETTE["surface"])
+    cs.apply()
+    fig, ax = plt.subplots(figsize=cs.SIZE_WIDE)
 
     for episode in episodes:
         ax.axvspan(episode["start"], episode["end"], facecolor=PALETTE["grid"],
@@ -613,12 +609,11 @@ def plot_lambda(lambdas: pd.DataFrame, episodes: list[dict], test: dict,
         # Policy dates as short ticks on the floor of the axes: the span says when the episode
         # ran, these say which dates drove it, without nine vertical rules across the data.
         for day in episode["events"]:
-            ax.plot([day, day], [0, 0.028], transform=ax.get_xaxis_transform(),
-                    color=PALETTE["ink_muted"], lw=0.9, zorder=4, clip_on=False)
+            ax.plot([day, day], [0, EPISODE_TICK], transform=ax.get_xaxis_transform(),
+                    color=PALETTE["ink"], lw=0.9, zorder=4, clip_on=False)
 
-    ax.axhline(0, color=PALETTE["ink_muted"], lw=1.0, zorder=3)
-    ax.plot(x, y, color=PALETTE["series"], lw=2.0, solid_capstyle="round",
-            solid_joinstyle="round", zorder=5)
+    cs.zero_line(ax)
+    ax.plot(x, y, color=PALETTE["series"], lw=1.6, zorder=5)
 
     # Headroom set from the data rather than left to autoscale: the extreme labels and the
     # episode labels both live in it, and without it they collide with the floor ticks.
@@ -631,44 +626,25 @@ def plot_lambda(lambdas: pd.DataFrame, episodes: list[dict], test: dict,
                     xy=(pd.Period(month, freq="M").to_timestamp(how="end"), value),
                     xytext=(0, 10 if value > 0 else -15), textcoords="offset points",
                     ha="center", va="bottom" if value > 0 else "top",
-                    fontsize=7.5, color=PALETTE["ink_muted"], zorder=6)
+                    fontsize=cs.TICK_SIZE, color=PALETTE["ink"], zorder=6)
 
-    ax.grid(axis="y", color=PALETTE["grid"], lw=0.6)
-    ax.set_axisbelow(True)
-    ax.set_ylabel("$\\lambda_{1,t}$   (% monthly return per s.d. of exposure)",
-                  fontsize=9, color=PALETTE["ink_muted"], labelpad=8)
-    ax.tick_params(labelsize=8, colors=PALETTE["ink_muted"])
+    ax.set_ylabel("$\\lambda_{1,t}$   (% monthly return per s.d.)")
+    ax.set_xlabel("Month")
     ax.xaxis.set_major_locator(YearLocator())
     ax.xaxis.set_major_formatter(DateFormatter("%Y"))
     ax.set_xlim(x.min() - pd.Timedelta(days=20), x.max() + pd.Timedelta(days=20))
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(PALETTE["grid"])
 
     top = ax.get_ylim()[1]
     for episode in episodes:
         middle = episode["start"] + (episode["end"] - episode["start"]) / 2
         ax.annotate(episode["label"], xy=(middle, top), xytext=(0, -6),
                     textcoords="offset points", ha="center", va="top",
-                    fontsize=8, color=PALETTE["ink_muted"], zorder=6)
+                    fontsize=cs.TICK_SIZE, color=PALETTE["ink"], zorder=6)
 
-    fig.suptitle("Monthly cross-sectional premium on tariff exposure, 2018-2025",
-                 fontsize=12, color=PALETTE["ink"], x=0.062, ha="left", y=0.985)
-    fig.text(0.062, 0.918,
-             f"Fama-MacBeth slope on TExp, one OLS per month over {test['n_months']} months. "
-             f"Mean {test['mean'] * 100:+.3f}% per s.d., Newey-West "
-             f"{test['lags']}-lag t = {test['t']:.2f}, p = {test['p']:.3f}.",
-             fontsize=8, color=PALETTE["ink_muted"], ha="left")
-    fig.text(0.062, 0.872,
-             "Shaded spans run from each policy cycle's first event to its last; ticks on the "
-             "floor are the individual policy dates.",
-             fontsize=8, color=PALETTE["ink_muted"], ha="left")
-
-    fig.tight_layout(rect=(0, 0, 1, 0.856))
-    fig.savefig(path, facecolor=PALETTE["surface"])
-    plt.close(fig)
-    return path
+    cs.frame(ax, max_yticks=MAX_YTICKS)
+    cs.figure_title(fig, "Monthly cross-sectional premium on tariff exposure")
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return cs.save(fig, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -1167,8 +1143,8 @@ def write_report(panel: pd.DataFrame, sample: pd.DataFrame, lambdas: pd.DataFram
     _say("     v6 drops it with the long-short portfolio it depended on.")
     _say("  Section 7.5 (sections 10-12) adds:")
     _say(f"  8. tau is a percentile of the EPU series over {tau_stats['span'][0]} .. "
-         f"{tau_stats['span'][1]}, per section 7.5 and")
-    _say("     the brief, not of the EPU values the estimated months carry. The window therefore")
+         f"{tau_stats['span'][1]}, per section 7.5,")
+    _say("     not of the EPU values the estimated months carry. The window therefore")
     _say(f"     includes {tau_stats['n_months'] - len(primary)} months outside the "
          f"Fama-MacBeth sample. The sample-window alternative")
     _say("     is reported in section 10 as a contrast and is not used.")
@@ -1233,9 +1209,9 @@ def main() -> pd.DataFrame:
     if len(primary) != expected:
         raise ValueError(f"estimated {len(primary)} monthly cross-sections, expected {expected}")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     lambdas.assign(ym=lambdas["ym"].astype(str)).to_csv(LAMBDA_OUT, index=False)
-    chart = plot_lambda(primary, episodes, newey_west(primary["lambda_texp"]))
+    chart = plot_lambda(primary, episodes)
 
     headline_csv = write_headline_results(headline_results(lambdas, params))
 
